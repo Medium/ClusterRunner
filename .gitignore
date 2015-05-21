@@ -47,3 +47,6 @@ clusterrunner.zip
 repos/
 results/
 slave_results/
+
+# Virtual Environment (virtualenv)
+venv
