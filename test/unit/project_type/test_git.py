@@ -194,6 +194,7 @@ class TestGit(BaseUnitTestCase):
         self.patch('app.project_type.git.os.path.isfile').return_value = False
         self.patch('app.project_type.git._GitRemoteCommandExecutor')
         Configuration['repo_directory'] = '/repo-directory'
+        Configuration['clone_project_from_master'] = True
 
         git = Git(url='http://original-user-specified-url.test/repo-path/repo-name')
         git.fetch_project()
