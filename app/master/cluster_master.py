@@ -172,7 +172,10 @@ class ClusterMaster(object):
 
         :type slave: Slave
         """
-        raise BadRequestError('Setup failure handling on the master is not yet implemented.')
+        build = self.get_build(slave.current_build_id)
+        build.cancel()
+        build.mark_failed('Unable to setup build on slave. Failing the build.')
+        slave.teardown()
 
     def handle_request_for_new_build(self, build_params):
         """
@@ -231,8 +234,8 @@ class ClusterMaster(object):
         self._logger.info('Results received from {} for subjob. (Build {}, Subjob {})', slave_url, build_id, subjob_id)
         build = self._all_builds_by_id[int(build_id)]
         slave = self._all_slaves_by_url[slave_url]
-        # If the build has been canceled, don't work on the next subjob.
-        if not build.is_finished:
+        # If the build has been canceled or failed, don't work on the next subjob.
+        if not build.is_finished or build.has_error:
             try:
                 build.complete_subjob(subjob_id, payload)
             finally:
