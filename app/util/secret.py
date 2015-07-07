@@ -1,5 +1,8 @@
+from app.util.log import get_logger
+
 import hmac
 
+logger = get_loggen(__name__)
 
 class Secret:
     DIGEST_HEADER_KEY = 'Clusterrunner-Message-Authentication-Digest'
@@ -46,6 +49,7 @@ class Secret:
         :rtype: str
         """
         hmac_digester = hmac.new(secret.encode('utf-8'), message.encode('utf-8'), digestmod='sha512')
+        logger.debug("secret message digest: " % (hmac_digester.hexdigest()))
         return hmac_digester.hexdigest()
 
     @classmethod
