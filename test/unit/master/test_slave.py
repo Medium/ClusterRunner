@@ -1,9 +1,12 @@
 from unittest.mock import Mock, MagicMock
 
+from app.master.atom import Atom, AtomState
 from app.master.build import Build
 from app.master.build_request import BuildRequest
-from app.master.slave import Slave
+from app.master.slave import DeadSlaveError, SlaveMarkedForShutdownError, Slave
+from app.master.subjob import Subjob
 from app.util.secret import Secret
+from app.util.session_id import SessionId
 from test.framework.base_unit_test_case import BaseUnitTestCase
 
 
@@ -48,10 +51,10 @@ class TestSlave(BaseUnitTestCase):
             'url': 'ssh://new-url-for-clusterrunner-master',
             'extra': 'something_extra',
         }))
-        mock_build = MagicMock(spec=Build, num_executors_allocated=777, build_request=build_request,
+        mock_build = MagicMock(spec=Build, build_request=build_request,
                                build_id=Mock(return_value=888), project_type=mock_git)
 
-        slave.setup(mock_build)
+        slave.setup(mock_build, executor_start_index=777)
 
         slave._network.post_with_digest.assert_called_with(
             'http://{}/v1/build/888/setup'.format(self._FAKE_SLAVE_URL),
@@ -64,6 +67,23 @@ class TestSlave(BaseUnitTestCase):
             },
             Secret.get()
         )
+
+    def test_build_id_is_set_on_master_before_telling_slave_to_setup(self):
+        # This test enforces an ordering that avoids a race where the slave finishes setup and posts back before the
+        # master has actually set the slave's current_build_id.
+        slave = self._create_slave()
+        mock_build = Mock()
+
+        def assert_slave_build_id_is_already_set(*args, **kwargs):
+            self.assertEqual(slave.current_build_id, mock_build.build_id(),
+                             'slave.current_build_id should be set before the master tells the slave to do setup.')
+
+        slave._network.post_with_digest = Mock(side_effect=assert_slave_build_id_is_already_set)
+        slave.setup(mock_build, executor_start_index=0)
+
+        self.assertEqual(slave._network.post_with_digest.call_count, 1,
+                         'The behavior that this test is checking depends on slave setup being triggered via '
+                         'slave._network.post_with_digest().')
 
     def test_is_alive_returns_cached_value_if_use_cache_is_true(self):
         slave = self._create_slave()
@@ -99,6 +119,69 @@ class TestSlave(BaseUnitTestCase):
         is_slave_alive = slave.is_alive(use_cached=False)
 
         self.assertTrue(is_slave_alive)
+
+    def test_is_alive_makes_correct_network_call_to_slave(self):
+        slave = self._create_slave(
+            slave_url='fake.slave.gov:43001',
+            slave_session_id='abc-123')
+
+        slave.is_alive(use_cached=False)
+
+        self.mock_network.get.assert_called_once_with(
+            'http://fake.slave.gov:43001/v1',
+            headers={SessionId.EXPECTED_SESSION_HEADER_KEY: 'abc-123'})
+
+    def test_mark_as_idle_raises_when_executors_are_in_use(self):
+        slave = self._create_slave()
+        slave._num_executors_in_use.increment()
+
+        self.assertRaises(Exception, slave.mark_as_idle)
+
+    def test_mark_as_idle_raises_when_slave_is_in_shutdown_mode(self):
+        slave = self._create_slave()
+        slave._is_in_shutdown_mode = True
+        slave.kill = Mock()
+
+        self.assertRaises(SlaveMarkedForShutdownError, slave.mark_as_idle)
+        slave.kill.assert_called_once_with()
+
+    def test_start_subjob_raises_if_slave_is_dead(self):
+        slave = self._create_slave()
+        slave._is_alive = False
+
+        self.assertRaises(DeadSlaveError, slave.start_subjob, Mock())
+
+    def test_start_subjob_raises_if_slave_is_shutdown(self):
+        slave = self._create_slave()
+        slave._is_in_shutdown_mode = True
+
+        self.assertRaises(SlaveMarkedForShutdownError, slave.start_subjob, Mock())
+
+    def test_set_shutdown_mode_should_set_is_shutdown_and_not_kill_slave_if_slave_has_a_build(self):
+        slave = self._create_slave()
+        slave.current_build_id = 1
+        slave.kill = Mock()
+
+        slave.set_shutdown_mode()
+
+        self.assertTrue(slave._is_in_shutdown_mode)
+        assert not slave.kill.called
+
+    def test_set_shutdown_mode_should_kill_slave_if_slave_has_no_build(self):
+        slave = self._create_slave()
+        slave.kill = Mock()
+
+        slave.set_shutdown_mode()
+
+        slave.kill.assert_called_once_with()
+
+    def test_kill_should_post_to_slave_api(self):
+        slave = self._create_slave()
+        slave._network.post_with_digest = Mock()
+
+        slave.kill()
+
+        assert slave._network.post_with_digest.called
 
     def _create_slave(self, **kwargs):
         """

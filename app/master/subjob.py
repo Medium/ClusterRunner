@@ -1,16 +1,12 @@
 import os
 
+from app.master.atom import AtomState
+from app.master.build_artifact import BuildArtifact
 from app.util.conf.configuration import Configuration
 from app.util.log import get_logger
 
 
 class Subjob(object):
-    ATOM_DIR_FORMAT = "artifact_{}_{}"
-    OUTPUT_FILE = 'clusterrunner_console_output'
-    EXIT_CODE_FILE = 'clusterrunner_exit_code'
-    COMMAND_FILE = 'clusterrunner_command'
-    TIMING_FILE = 'clusterrunner_time'
-
     def __init__(self, build_id, subjob_id, project_type, job_config, atoms):
         """
         :param build_id:
@@ -19,7 +15,7 @@ class Subjob(object):
         :type subjob_id: int
         :param project_type:
         :type project_type: ProjectType
-        :param job_config: the job's configuration from cluster_runner.yaml
+        :param job_config: the job's configuration from clusterrunner.yaml
         :type job_config: JobConfig
         :param atoms: the atom project_type strings
         :type atoms: list[app.master.atom.Atom]
@@ -31,25 +27,66 @@ class Subjob(object):
         self.project_type = project_type
         self.job_config = job_config
         self._atoms = atoms
+        self._set_atoms_subjob_id(atoms, subjob_id)
+        self._set_atom_state(AtomState.NOT_STARTED)
         self.timings = {}  # a dict, atom_ids are the keys and seconds are the values
+        self.slave = None  # The slave that had been assigned this subjob. Is None if not started.
+
+    def _set_atoms_subjob_id(self, atoms, subjob_id):
+        """
+        Set the subjob_id on each atom
+        :param atoms: an array of atoms to set the subjob_id on
+        :type atoms: list[app.master.atom.Atom]
+        :param subjob_id: the subjob_id to set on the atoms
+        :type subjob_id: int
+        """
+        for atom in atoms:
+            atom.subjob_id = subjob_id
+
+    def _set_atom_state(self, state):
+        """
+        Set the state of all atoms of the subjob.
+
+        :param state: up-to-date state of all atoms of the subjob
+        :type state: `:class:AtomState`
+        """
+        for atom in self._atoms:
+            atom.state = state
+
+    def mark_in_progress(self, slave):
+        """
+        Mark the subjob IN_PROGRESS, which marks the state of all the atoms of the subjob IN_PROGRESS.
+
+        :param slave: the slave node that has been assigned this subjob.
+        :type slave: Slave
+        """
+        self._set_atom_state(AtomState.IN_PROGRESS)
+        self.slave = slave
+
+    def mark_completed(self):
+        """
+        Mark the subjob COMPLETED, which marks the state of all the atoms of the subjob COMPLETED.
+        """
+        self._set_atom_state(AtomState.COMPLETED)
 
     def api_representation(self):
         """
         :rtype: dict [str, str]
         """
+
         return {
             'id': self._subjob_id,
             'command': self.job_config.command,
-            'atoms': self.get_atoms()
+            'atoms': [atom.api_representation() for atom in self._atoms],
+            'slave': self.slave.url if self.slave else None,
         }
 
-    def get_atoms(self):
-        return [{
-            'id': idx,
-            'atom': atom.command_string,
-            'expected_time': atom.expected_time,
-            'actual_time': atom.actual_time,
-        } for idx, atom in enumerate(self._atoms)]
+    @property
+    def atoms(self):
+        """
+        :rtype: list[app.master.atom.Atom]
+        """
+        return self._atoms
 
     def build_id(self):
         """
@@ -73,18 +110,6 @@ class Subjob(object):
         job_command = self.job_config.command
         return ['{} {}'.format(atom.command_string, job_command) for atom in self._atoms]
 
-    def _timings_file_path(self, atom_id, result_root=None):
-        """
-        The path to read/write the subjob's timing data from, relative to a root 'result' directory
-
-        :param int atom_id: id for the atom
-        :param str result_root: root of the result path
-        :rtype: str
-        """
-        return os.path.join(self.artifact_dir(result_root),
-                            Subjob.ATOM_DIR_FORMAT.format(self._subjob_id, atom_id),
-                            Subjob.TIMING_FILE)
-
     def add_timings(self, timings):
         """
         Add timing data for this subjob's atoms, collected from a slave
@@ -101,17 +126,17 @@ class Subjob(object):
         """
         timings = {}
         for atom_id, atom in enumerate(self._atoms):
-
-            timings_file_path = self._timings_file_path(
-                atom_id, result_root=Configuration['results_directory'])
+            artifact_dir = BuildArtifact.atom_artifact_directory(
+                self.build_id(),
+                self.subjob_id(),
+                atom_id,
+                result_root=Configuration['results_directory']
+            )
+            timings_file_path = os.path.join(artifact_dir, BuildArtifact.TIMING_FILE)
             if os.path.exists(timings_file_path):
                 with open(timings_file_path, 'r') as f:
-                    # Strip out the project directory from atom timing data in order to have all
-                    # atom timing data be relative and project directory agnostic (the project
-                    # directory will be a generated unique path for every build).
-                    atom_key = atom.command_string.replace(self.project_type.project_directory, '')
                     atom.actual_time = float(f.readline())
-                    timings[atom_key] = atom.actual_time
+                    timings[atom.command_string] = atom.actual_time
             else:
                 self._logger.warning('No timing data for subjob {} atom {}.',
                                      self._subjob_id, atom_id)
@@ -120,15 +145,3 @@ class Subjob(object):
             self._logger.warning('No timing data for subjob {}.', self._subjob_id)
 
         return timings
-
-    def artifact_dir(self, result_root=None):
-        """
-        Generate the path to where the artifacts for a subjob should be stored on the file system.
-
-        :type result_root: str
-        :rtype: string
-        """
-        return os.path.join(
-            result_root or Configuration['artifact_directory'],
-            str(self._build_id)
-        )

@@ -1,4 +1,5 @@
 from contextlib import suppress
+import http.client
 import os
 from os import path
 import shutil
@@ -6,9 +7,11 @@ import tempfile
 from unittest import TestCase
 
 from app.util import log
-from app.util.conf.base_config_loader import BASE_CONFIG_FILE_SECTION
-from app.util.conf.config_file import ConfigFile
+from app.util.fs import create_dir, extract_tar
+from app.util.process_utils import is_windows
+from app.util.network import Network
 from app.util.secret import Secret
+from app.master.build_artifact import BuildArtifact
 from test.framework.functional.fs_item import Directory
 from test.framework.functional.functional_test_cluster import FunctionalTestCluster, TestClusterTimeoutError
 
@@ -24,19 +27,9 @@ class BaseFunctionalTestCase(TestCase):
         log.configure_logging('DEBUG')
 
         Secret.set('testsecret')
-        self.test_app_base_dir = tempfile.TemporaryDirectory()
 
-        self.test_conf_file_path = self._create_test_config_file({
-            'secret': Secret.get(),
-            'base_directory': self.test_app_base_dir.name,
-            # Set the max log file size to a low value so that we cause  at least one rollover during the test.
-            'max_log_file_size': 1024 * 5,
-        })
-
-        self.cluster = FunctionalTestCluster(
-            conf_file_path=self.test_conf_file_path,
-            verbose=self._get_test_verbosity(),
-        )
+        self.cluster = FunctionalTestCluster(verbose=self._get_test_verbosity())
+        self._network = Network()
 
     def _create_test_config_file(self, conf_values_to_set=None):
         """
@@ -61,21 +54,29 @@ class BaseFunctionalTestCase(TestCase):
         return test_conf_file_path
 
     def tearDown(self):
-        # Clean up files created during this test
-        with suppress(FileNotFoundError):
-            os.remove(self.test_conf_file_path)
-
         # Give the cluster a bit of extra time to finish working (before forcefully killing it and failing the test)
         with suppress(TestClusterTimeoutError):
             self.cluster.block_until_build_queue_empty(timeout=5)
 
         # Kill processes and make sure all processes exited with 0 exit code
         services = self.cluster.kill()
-        for service in services:
-            self.assertEqual(service.return_code, 0, 'Service running on url: {} should exit with code 0, but exited '
-                                                     'with code {}.'.format(service.url, service.return_code))
+
+        # only check the exit code if not on Windows as Popen.terminate kills the process on Windows and the exit
+        # code is not zero.
+        # TODO: remove the is_windows() check after we can handle exit on Windows gracefully.
+        if not is_windows():
+            for service in services:
+                self.assertEqual(
+                    service.return_code,
+                    0,
+                    'Service running on url: {} should exit with code 0, but exited with code {}.'.format(
+                        service.url,
+                        service.return_code,
+                    ),
+                )
         # Remove the temp dir. This will delete the log files, so should be run after cluster shuts down.
-        self.test_app_base_dir.cleanup()
+        self.cluster.master_app_base_dir.cleanup()
+        [slave_app_base_dir.cleanup() for slave_app_base_dir in self.cluster.slaves_app_base_dirs]
 
     def _get_test_verbosity(self):
         """
@@ -146,17 +147,19 @@ class BaseFunctionalTestCase(TestCase):
             }
         self.assert_build_status_contains_expected_data(build_id, expected_failure_build_params)
 
-    def assert_build_artifact_contents_match_expected(self, build_id, expected_build_artifact_contents):
+    def assert_build_artifact_contents_match_expected(self, master_api, build_id, expected_build_artifact_contents):
         """
         Assert that artifact files for this build have the expected contents.
 
+        :type master_api: app.util.url_builder.UrlBuilder
         :param build_id: The id of the build whose artifacts to check
         :type build_id: int
         :param expected_build_artifact_contents: A list of FSItems corresponding to the expected artifact dir contents
         :type expected_build_artifact_contents: list[FSItem]
         """
-        build_artifacts_dir_path = os.path.join(self.test_app_base_dir.name, 'results', 'master', str(build_id))
-        self.assert_directory_contents_match_expected(build_artifacts_dir_path, expected_build_artifact_contents)
+        with tempfile.TemporaryDirectory() as build_artifacts_dir_path:
+            self._download_and_extract_results(master_api, build_id, build_artifacts_dir_path)
+            self.assert_directory_contents_match_expected(build_artifacts_dir_path, expected_build_artifact_contents)
 
     def assert_directory_contents_match_expected(self, dir_path, expected_dir_contents):
         """
@@ -172,3 +175,22 @@ class BaseFunctionalTestCase(TestCase):
             expected_dir_name = os.path.basename(dir_path)
             expected_build_artifacts = Directory(expected_dir_name, expected_dir_contents)
             expected_build_artifacts.assert_matches_path(dir_path, allow_extra_items=False)
+
+    def _download_and_extract_results(self, master_api, build_id, download_dir):
+        """
+        :type master_api: app.util.url_builder.UrlBuilder
+        :type build_id: int
+        :type download_dir: str
+        """
+        download_artifacts_url = master_api.url('build', build_id, 'result')
+        download_filepath = os.path.join(download_dir, BuildArtifact.ARTIFACT_FILE_NAME)
+        response = self._network.get(download_artifacts_url)
+
+        if response.status_code == http.client.OK:
+            # save tar file to disk, decompress, and delete
+            with open(download_filepath, 'wb') as file:
+                chunk_size = 500 * 1024
+                for chunk in response.iter_content(chunk_size):
+                    file.write(chunk)
+
+            extract_tar(download_filepath, delete=True)

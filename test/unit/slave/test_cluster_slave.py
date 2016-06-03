@@ -1,15 +1,18 @@
 import builtins
-from genty import genty, genty_dataset
 import http.client
-import requests
-import requests.models
 from threading import Event
+from unittest import skip
 from unittest.mock import ANY, call, MagicMock, Mock, mock_open, patch
 
+from genty import genty, genty_dataset
+import requests
+import requests.models
+
 from app.project_type.project_type import SetupFailureError
-from app.slave.cluster_slave import BuildTeardownError, ClusterSlave, SlaveState
+from app.slave.cluster_slave import ClusterSlave, SlaveState
 from app.util.exceptions import BadRequestError
 from app.util.safe_thread import SafeThread
+from app.util.single_use_coin import SingleUseCoin
 from app.util.unhandled_exception_handler import UnhandledExceptionHandler
 from test.framework.base_unit_test_case import BaseUnitTestCase
 
@@ -36,7 +39,7 @@ class TestClusterSlave(BaseUnitTestCase):
         incorrect_build_id = 300
 
         with self.assertRaises(BadRequestError, msg='Start subjob should raise error if incorrect build_id specified.'):
-            slave.start_working_on_subjob(incorrect_build_id, 1, '~/test', ['ls'])
+            slave.start_working_on_subjob(incorrect_build_id, 1, ['ls'])
 
     @genty_dataset(
         current_build_id_not_set=(None,),
@@ -88,6 +91,7 @@ class TestClusterSlave(BaseUnitTestCase):
 
         slave = self._create_cluster_slave(num_executors=3)
         slave.connect_to_master(self._FAKE_MASTER_URL)
+        slave._build_teardown_coin = SingleUseCoin()
         self.trigger_graceful_app_shutdown()
 
         expected_disconnect_call = call.mock_network.put_with_digest(disconnect_api_url, request_params=ANY,
@@ -112,40 +116,55 @@ class TestClusterSlave(BaseUnitTestCase):
         slave = self._create_cluster_slave()
         expected_results_api_url = 'http://{}/v1/build/123/subjob/321/result'.format(self._FAKE_MASTER_URL)
         expected_idle_api_url = 'http://{}/v1/slave/1'.format(self._FAKE_MASTER_URL)
-        subjob_done_event, teardown_done_event = self._mock_network_post_and_put(expected_results_api_url,
+        subjob_done_event, teardown_done_event, setup_done_event = self._mock_network_post_and_put(expected_results_api_url,
                                                                                  expected_idle_api_url)
         slave.connect_to_master(self._FAKE_MASTER_URL)
+
         slave.setup_build(build_id=123, project_type_params={'type': 'Fake'}, build_executor_start_index=0)
-        slave.start_working_on_subjob(build_id=123, subjob_id=321,
-                                      subjob_artifact_dir='', atomic_commands=[])
+        self.assertTrue(setup_done_event.wait(timeout=5), 'Setup code under test should put to expected idle '
+                                                          'url very quickly.')
+
+        slave.start_working_on_subjob(build_id=123, subjob_id=321, atomic_commands=[])
         # The timeout for this wait() is arbitrary, but it should be generous so the test isn't flaky on slow machines.
         self.assertTrue(subjob_done_event.wait(timeout=5), 'Subjob execution code under test should post to expected '
                                                            'results url very quickly.')
+
         slave.teardown_build(123)
-        self.assertTrue(teardown_done_event.wait(timeout=5), 'Teardown code under test should post to expected idle '
+        self.assertTrue(teardown_done_event.wait(timeout=5), 'Teardown code under test should put to expected idle '
                                                              'url very quickly.')
         self.trigger_graceful_app_shutdown()  # Triggering shutdown should not raise an exception.
 
     def _mock_network_post_and_put(self, expected_results_api_url, expected_idle_api_url):
         # Since subjob execution and teardown is async, we use Events to tell our test when each thread has completed.
         subjob_done_event = Event()
+        setup_done_event = Event()
         teardown_done_event = Event()
 
-        def fake_network_post_and_put(url, *args, **kwargs):
-            if url == expected_results_api_url:
-                subjob_done_event.set()  # Consider subjob finished once code posts to results url.
-            elif url == expected_idle_api_url:
-                teardown_done_event.set()
+        def _get_success_mock_response():
             mock_response = MagicMock(spec=requests.models.Response, create=True)
             mock_response.status_code = http.client.OK
             return mock_response
 
-        self.mock_network.post = fake_network_post_and_put
-        self.mock_network.put = fake_network_post_and_put
-        self.mock_network.put_with_digest = fake_network_post_and_put
-        return subjob_done_event, teardown_done_event
+        def fake_network_post(url, *args, **kwargs):
+            if url == expected_results_api_url:
+                subjob_done_event.set()  # Consider subjob finished once code posts to results url.
+            return _get_success_mock_response()
 
-    def test_executing_build_teardown_multiple_times_will_raise_exception(self):
+        def fake_network_put(url, request_params, **kwargs):
+            if url == expected_idle_api_url:
+                if request_params['slave']['state'] == SlaveState.SETUP_COMPLETED:
+                    setup_done_event.set()
+                elif request_params['slave']['state'] == SlaveState.IDLE:
+                    teardown_done_event.set()
+            return _get_success_mock_response()
+
+        self.mock_network.post = fake_network_post
+        self.mock_network.put = fake_network_put
+        self.mock_network.put_with_digest = fake_network_put
+        return subjob_done_event, teardown_done_event, setup_done_event
+
+    @skip('Flaky - see issue # 178')
+    def test_executing_build_teardown_multiple_times_will_not_raise_exception(self):
         self.mock_network.post().status_code = http.client.OK
         slave = self._create_cluster_slave()
         project_type_mock = self.patch('app.slave.cluster_slave.util.create_project_type').return_value
@@ -154,7 +173,7 @@ class TestClusterSlave(BaseUnitTestCase):
         project_type_mock.fetch_project.side_effect = self.no_args_side_effect(setup_complete_event.set)
         # This test uses teardown_event to cause a thread to block on the teardown_build() call.
         teardown_event = Event()
-        project_type_mock.teardown_build.side_effect = self.no_args_side_effect(teardown_event.wait)
+        project_type_mock.teardown_build = Mock()
 
         slave.connect_to_master(self._FAKE_MASTER_URL)
         slave.setup_build(build_id=123, project_type_params={'type': 'Fake'}, build_executor_start_index=0)
@@ -163,10 +182,10 @@ class TestClusterSlave(BaseUnitTestCase):
         # Start the first thread that does build teardown. This thread will block on teardown_build().
         first_thread = SafeThread(target=slave._do_build_teardown_and_reset)
         first_thread.start()
-        # Call build teardown() again and it should raise an exception.
-        with self.assertRaises(BuildTeardownError):
-            slave._do_build_teardown_and_reset()
+        # Call build teardown() again and it should not run teardown again
+        slave._do_build_teardown_and_reset()
 
+        project_type_mock.teardown_build.assert_called_once_with(timeout=None)
         # Cleanup: Unblock the first thread and let it finish. We use the unhandled exception handler just in case any
         # exceptions occurred on the thread (so that they'd be passed back to the main thread and fail the test).
         teardown_event.set()
@@ -214,10 +233,9 @@ class TestClusterSlave(BaseUnitTestCase):
         slave._idle_executors = Mock()
 
         with patch.object(builtins, 'open', mock_open(read_data='asdf')):
-            slave._execute_subjob(build_id=1, subjob_id=2, executor=executor, subjob_artifact_dir='',
-                                  atomic_commands=[])
+            slave._execute_subjob(build_id=1, subjob_id=2, executor=executor, atomic_commands=[])
 
-        executor.execute_subjob.assert_called_with(1, 2, '', [], 12)
+        executor.execute_subjob.assert_called_with(1, 2, [], 12)
 
     def _create_cluster_slave(self, **kwargs):
         """

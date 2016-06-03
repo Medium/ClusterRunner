@@ -1,11 +1,17 @@
+from collections import OrderedDict
 from enum import Enum
 import os
 from queue import Queue, Empty
+import shutil
+import time
 from threading import Lock
 import uuid
 
 from app.master.build_artifact import BuildArtifact
-from app.util import analytics, util
+from app.master.build_fsm import BuildFsm, BuildEvent, BuildState
+from app.master.build_request import BuildRequest
+from app.project_type.project_type import ProjectType
+from app.util import util
 from app.util.conf.configuration import Configuration
 from app.util.counter import Counter
 from app.util.exceptions import ItemNotFoundError
@@ -21,6 +27,13 @@ class Build(object):
         - exposes the overall status of the build
         - keeps track of the build's subjobs and their completion state
         - manages slaves that have been assigned to accept this build's subjobs
+
+    :type _build_id: int
+    :type _build_request: BuildRequest
+    :type _build_artifact: None | BuildArtifact
+    :type _error_message: None | str
+    :type _project_type: None | ProjectType
+    :type _timing_file_path: None | str
     """
     _build_id_counter = Counter()  # class-level counter for assigning build ids
 
@@ -30,43 +43,57 @@ class Build(object):
         """
         self._logger = get_logger(__name__)
         self._build_id = self._build_id_counter.increment()
-        self.build_request = build_request
+        self._build_request = build_request
         self._artifacts_archive_file = None
         self._build_artifact = None
-        """ :type : BuildArtifact"""
 
         self._error_message = None
-        self.is_prepared = False
         self._preparation_coin = SingleUseCoin()  # protects against separate threads calling prepare() more than once
-        self._is_canceled = False
 
         self._project_type = None
         self._build_completion_lock = Lock()  # protects against more than one thread detecting the build's finish
-        self._slaves_allocated = []
-        self._num_executors_allocated = 0
-        self._num_executors_in_use = 0
-
-        self._max_executors = float('inf')
-        self._max_executors_per_slave = float('inf')
 
         self._all_subjobs_by_id = {}
-        self._unstarted_subjobs = None
+        self._unstarted_subjobs = None  # WIP(joey): Move subjob queues to BuildScheduler class.
         self._finished_subjobs = None
-        self._postbuild_tasks_are_finished = False
+        self._failed_atoms = None
+        self._postbuild_tasks_are_finished = False  # WIP(joey): Remove and use build state.
         self._timing_file_path = None
 
+        self._state_machine = BuildFsm(
+            build_id=self._build_id,
+            enter_state_callbacks={
+                BuildState.ERROR: self._on_enter_error_state,
+                BuildState.CANCELED: self._on_enter_canceled_state,
+            }
+        )
+
     def api_representation(self):
+        failed_atoms_api_representation = None
+        if self._get_failed_atoms() is not None:
+            failed_atoms_api_representation = [failed_atom.api_representation()
+                                               for failed_atom in self._get_failed_atoms()]
+        build_state = self._status()
+        # todo: PREPARING/PREPARED are new states -- make sure clients can handle them before exposing.
+        if build_state in (BuildState.PREPARING, BuildState.PREPARED):
+            build_state = BuildState.QUEUED
+
         return {
             'id': self._build_id,
-            'status': self._status(),
+            'status': build_state,
             'artifacts': self._artifacts_archive_file,  # todo: this should probably be a url, not a file path
             'details': self._detail_message,
             'error_message': self._error_message,
             'num_atoms': self._num_atoms,
             'num_subjobs': len(self._all_subjobs_by_id),
-            'failed_atoms': self._failed_atoms(),  # todo: print the file contents instead of paths
+            'failed_atoms': failed_atoms_api_representation,
             'result': self._result(),
             'request_params': self.build_request.build_parameters(),
+            # Convert self._state_timestamps to OrderedDict to make raw API response more readable. Sort the entries
+            # by numerically increasing dict value, with None values sorting highest.
+            'state_timestamps': OrderedDict(sorted(
+                [(state.lower(), timestamp) for state, timestamp in self._state_machine.transition_timestamps.items()],
+                key=lambda item: item[1] or float('inf'))),
         }
 
     def generate_project_type(self):
@@ -87,33 +114,47 @@ class Build(object):
         project_type_params = self.build_request.build_parameters()
         project_type_params.update({'build_project_directory': build_specific_project_directory})
         self._project_type = util.create_project_type(project_type_params)
-
         if self._project_type is None:
             raise BuildProjectError('Build failed due to an invalid project type.')
 
-    def prepare(self, subjobs, job_config):
+    def prepare(self, subjob_calculator):
         """
-        :type subjobs: list[Subjob]
-        :type job_config: JobConfig
+        :param subjob_calculator: Used after project fetch to atomize and group subjobs for this build
+        :type subjob_calculator: SubjobCalculator
         """
-        if self.project_type is None:
-            raise RuntimeError('prepare() was called before generate_project_type() on build {}.'
-                               .format(self._build_id))
+        if not isinstance(self.build_request, BuildRequest):
+            raise RuntimeError('Build {} has no associated request object.'.format(self._build_id))
+
+        if not isinstance(self.project_type, ProjectType):
+            raise RuntimeError('Build {} has no project set.'.format(self._build_id))
 
         if not self._preparation_coin.spend():
             raise RuntimeError('prepare() was called more than once on build {}.'.format(self._build_id))
 
-        self._unstarted_subjobs = Queue(maxsize=len(subjobs))
-        self._finished_subjobs = Queue(maxsize=len(subjobs))
+        self._state_machine.trigger(BuildEvent.START_PREPARE)
+        # WIP(joey): Move the following code into a PREPARING state callback
+        #  (so that it won't execute if the build has already been canceled.)
+
+        self._logger.info('Fetching project for build {}.', self._build_id)
+        self.project_type.fetch_project()
+        self._logger.info('Successfully fetched project for build {}.', self._build_id)
+
+        job_config = self.project_type.job_config()
+        if job_config is None:
+            raise RuntimeError('Build failed while trying to parse clusterrunner.yaml.')
+
+        subjobs = subjob_calculator.compute_subjobs_for_build(self._build_id, job_config, self.project_type)
+
+        self._unstarted_subjobs = Queue(maxsize=len(subjobs))  # WIP(joey): Move this into BuildScheduler?
+        self._finished_subjobs = Queue(maxsize=len(subjobs))  # WIP(joey): Remove this and just record finished count.
 
         for subjob in subjobs:
             self._all_subjobs_by_id[subjob.subjob_id()] = subjob
             self._unstarted_subjobs.put(subjob)
 
-        self._max_executors = job_config.max_executors
-        self._max_executors_per_slave = job_config.max_executors_per_slave
-        self._timing_file_path = self.project_type.timing_file_path(job_config.name)
-        self.is_prepared = True
+        self._timing_file_path = self._project_type.timing_file_path(job_config.name)
+        app.util.fs.create_dir(self._build_results_dir())
+        self._state_machine.trigger(BuildEvent.FINISH_PREPARE)
 
     def build_id(self):
         """
@@ -121,24 +162,12 @@ class Build(object):
         """
         return self._build_id
 
-    def needs_more_slaves(self):
+    @property
+    def build_request(self):
         """
-        Determine whether or not this build should have more slaves allocated to it.
-
-        :rtype: bool
+        :rtype: BuildRequest
         """
-        return self._num_executors_allocated < self._max_executors and not self._unstarted_subjobs.empty()
-
-    def allocate_slave(self, slave):
-        """
-        Allocate a slave to this build. This tells the slave to execute setup commands for this build.
-
-        :type slave: Slave
-        """
-        self._slaves_allocated.append(slave)
-        slave.setup(self)
-        self._num_executors_allocated += min(slave.num_executors, self._max_executors_per_slave)
-        analytics.record_event(analytics.BUILD_SETUP_START, build_id=self.build_id(), slave_id=slave.id)
+        return self._build_request
 
     def all_subjobs(self):
         """
@@ -158,45 +187,6 @@ class Build(object):
             raise ItemNotFoundError('Invalid subjob id.')
         return subjob
 
-    def begin_subjob_executions_on_slave(self, slave):
-        """
-        Begin subjob executions on a slave. This should be called once after the specified slave has already run
-        build_setup commands for this build.
-
-        :type slave: Slave
-        """
-        analytics.record_event(analytics.BUILD_SETUP_FINISH, build_id=self.build_id(), slave_id=slave.id)
-        for slave_executor_count in range(slave.num_executors):
-            if (self._num_executors_in_use >= self._max_executors
-                    or slave_executor_count >= self._max_executors_per_slave):
-                break
-            slave.claim_executor()
-            self._num_executors_in_use += 1
-            self.execute_next_subjob_or_teardown_slave(slave)
-
-    def execute_next_subjob_or_teardown_slave(self, slave):
-        """
-        Grabs an unstarted subjob off the queue and sends it to the specified slave to be executed. If the unstarted
-        subjob queue is empty, we teardown the slave to free it up for other builds.
-
-        :type slave: Slave
-        """
-        try:
-            subjob = self._unstarted_subjobs.get(block=False)
-            self._logger.debug('Sending subjob {} (build {}) to slave {}.',
-                               subjob.subjob_id(), subjob.build_id(), slave.url)
-            slave.start_subjob(subjob)
-
-        except Empty:
-            num_executors_in_use = slave.free_executor()
-            if num_executors_in_use == 0:
-                try:
-                    self._slaves_allocated.remove(slave)
-                except ValueError:
-                    pass  # We have already deallocated this slave, no need to teardown
-                else:
-                    slave.teardown()
-
     def complete_subjob(self, subjob_id, payload=None):
         """
         Handle the subjob payload and mark the given subjob id for this build as complete.
@@ -212,19 +202,31 @@ class Build(object):
             self.mark_failed('Error occurred while completing subjob {}.'.format(subjob_id))
             raise
 
+    def _parse_payload_for_atom_exit_code(self, subjob_id):
+        subjob = self.subjob(subjob_id)
+        for atom_id in range(len(subjob.atoms)):
+            artifact_dir = BuildArtifact.atom_artifact_directory(
+                self.build_id(),
+                subjob.subjob_id(),
+                atom_id,
+                result_root=Configuration['results_directory']
+            )
+            atom_exit_code_file_sys_path = os.path.join(artifact_dir, BuildArtifact.EXIT_CODE_FILE)
+            with open(atom_exit_code_file_sys_path, 'r') as atom_exit_code_file:
+                subjob.atoms[atom_id].exit_code = int(atom_exit_code_file.read())
+
     def _handle_subjob_payload(self, subjob_id, payload):
         if not payload:
             self._logger.warning('No payload for subjob {} of build {}.', subjob_id, self._build_id)
             return
 
         # Assertion: all payloads received from subjobs are uniquely named.
-        result_file_path = os.path.join(
-            self._build_results_dir(),
-            payload['filename'])
+        result_file_path = os.path.join(self._build_results_dir(), payload['filename'])
 
         try:
             app.util.fs.write_file(payload['body'], result_file_path)
             app.util.fs.extract_tar(result_file_path, delete=True)
+            self._parse_payload_for_atom_exit_code(subjob_id)
         except:
             self._logger.warning('Writing payload for subjob {} of build {} FAILED.', subjob_id, self._build_id)
             raise
@@ -244,37 +246,59 @@ class Build(object):
         """
         :type subjob_id: int
         """
-        subjob = self._all_subjobs_by_id[int(subjob_id)]
+        subjob = self.subjob(subjob_id)
+        subjob.mark_completed()
         with self._build_completion_lock:
             self._finished_subjobs.put(subjob, block=False)
-            subjobs_are_finished = self._subjobs_are_finished
+            should_trigger_postbuild_tasks = self._all_subjobs_are_finished() and not self._is_stopped()
 
         # We use a local variable here which was set inside the _build_completion_lock to prevent a race condition
-        if subjobs_are_finished:
+        if should_trigger_postbuild_tasks:
             self._logger.info("All results received for build {}!", self._build_id)
             SafeThread(target=self._perform_async_postbuild_tasks, name='PostBuild{}'.format(self._build_id)).start()
+
+    def mark_started(self):
+        """
+        Mark the build as started.
+        """
+        self._state_machine.trigger(BuildEvent.START_BUILDING)
+
+    def finish(self):
+        """
+        Perform postbuild task and mark this build as finished.
+        """
+        # This method also transitions the FSM to finished after the postbuild tasks are complete.
+        self._perform_async_postbuild_tasks()
 
     def mark_failed(self, failure_reason):
         """
         Mark a build as failed and set a failure reason. The failure reason should be something we can present to the
         end user of ClusterRunner, so try not to include detailed references to internal implementation.
-
         :type failure_reason: str
         """
-        self._logger.error('Build {} failed: {}', self.build_id(), failure_reason)
-        self._error_message = failure_reason
+        self._state_machine.trigger(BuildEvent.FAIL, error_msg=failure_reason)
+
+    def _on_enter_error_state(self, event):
+        """
+        Store an error message for the build and log the failure. This method is triggered by
+        a state machine transition to the ERROR state.
+        :param event: The Fysom event object
+        """
+        # WIP(joey): Should this be a reenter_state callback also? Should it check for previous error message?
+        default_error_msg = 'An unspecified error occurred.'
+        self._error_message = getattr(event, 'error_msg', default_error_msg)
+        self._logger.warning('Build {} failed: {}', self.build_id(), self._error_message)
 
     def cancel(self):
         """
-        Cancel a running build
+        Cancel a running build.
         """
-        # Early exit if build is not running
-        if self._status() in [BuildStatus.FINISHED, BuildStatus.ERROR, BuildStatus.CANCELED]:
-            return
+        self._logger.notice('Request received to cancel build {}.', self._build_id)
+        self._state_machine.trigger(BuildEvent.CANCEL)
 
-        self._is_canceled = True
-
+    def _on_enter_canceled_state(self, event):
         # Deplete the unstarted subjob queue.
+        # WIP(joey): Just remove this completely and adjust behavior of other methods based on self._is_canceled().
         # TODO: Handle situation where cancel() is called while subjobs are being added to _unstarted_subjobs
         while self._unstarted_subjobs is not None and not self._unstarted_subjobs.empty():
             try:
@@ -327,16 +351,10 @@ class Build(object):
         return self._project_type
 
     @property
-    def num_executors_allocated(self):
-        """
-        :rtype: int
-        """
-        return self._num_executors_allocated
-
-    @property
     def artifacts_archive_file(self):
         return self._artifacts_archive_file
 
+    # WIP(joey): Change some of these private @properties to methods.
     @property
     def _num_subjobs_total(self):
         return len(self._all_subjobs_by_id)
@@ -347,26 +365,18 @@ class Build(object):
 
     @property
     def _num_atoms(self):
-        if self._status() not in [BuildStatus.BUILDING, BuildStatus.FINISHED]:
+        # todo: blacklist states instead of whitelist, or just check _all_subjobs_by_id directly
+        if self._status() not in [BuildState.BUILDING, BuildState.FINISHED]:
             return None
         return sum([len(subjob.atomic_commands()) for subjob in self._all_subjobs_by_id.values()])
 
-    @property
-    def _subjobs_are_finished(self):
-        return self._is_canceled or (self.is_prepared and self._finished_subjobs.full())
+    def _all_subjobs_are_finished(self):
+        return self._finished_subjobs and self._finished_subjobs.full()
 
     @property
     def is_finished(self):
-        # TODO: Clean up this logic or move everything into a state machine
-        return self._is_canceled or self._postbuild_tasks_are_finished
-
-    @property
-    def is_unstarted(self):
-        return self.is_prepared and self._num_executors_allocated == 0 and self._unstarted_subjobs.full()
-
-    @property
-    def has_error(self):
-        return self._error_message is not None
+        # WIP(joey): Calling logic should check _is_canceled if it needs to instead of including the check here.
+        return self._is_canceled() or self._postbuild_tasks_are_finished
 
     @property
     def _detail_message(self):
@@ -378,43 +388,53 @@ class Build(object):
             )
         return None
 
-    def _status(self):
+    def _status(self):  # WIP(joey): Rename to _state.
         """
-        :rtype: BuildStatus
+        :rtype: BuildState
         """
-        if self.has_error:
-            return BuildStatus.ERROR
-        elif self._is_canceled:
-            return BuildStatus.CANCELED
-        elif not self.is_prepared or self.is_unstarted:
-            return BuildStatus.QUEUED
-        elif self.is_finished:
-            return BuildStatus.FINISHED
-        else:
-            return BuildStatus.BUILDING
+        return self._state_machine.state
 
-    def _failed_atoms(self):
-        """
-        The commands which failed
-        :rtype: list [str] | None
-        """
-        if self._is_canceled:
-            return []
+    @property
+    def has_error(self):
+        return self._status() is BuildState.ERROR
 
-        if self.is_finished:
-            # dict.values() returns a view object in python 3, so wrapping values() in a list
-            return list(self._build_artifact.get_failed_commands().values())
-        return None
+    def _is_canceled(self):
+        return self._status() is BuildState.CANCELED
+
+    def _is_stopped(self):
+        return self._status() in (BuildState.ERROR, BuildState.CANCELED)
+
+    def _get_failed_atoms(self):
+        """
+        The atoms that failed. Returns None if the build hasn't completed yet. Returns empty set if
+        build has completed and no atoms have failed.
+        :rtype: list[Atom] | None
+        """
+        if self._failed_atoms is None and self.is_finished:
+            if self._is_canceled():
+                return []
+
+            self._failed_atoms = []
+            for subjob_id, atom_id in self._build_artifact.get_failed_subjob_and_atom_ids():
+                subjob = self.subjob(subjob_id)
+                atom = subjob.atoms[atom_id]
+                self._failed_atoms.append(atom)
+
+        return self._failed_atoms
 
     def _result(self):
         """
-        :rtype: str | None
+        Can return three states:
+            None:
+            FAILURE:
+            NO_FAILURES:
+        :rtype: BuildResult | None
         """
-        if self._is_canceled:
+        if self._is_canceled():
             return BuildResult.FAILURE
 
         if self.is_finished:
-            if len(self._build_artifact.get_failed_commands()) == 0:
+            if len(self._build_artifact.get_failed_subjob_and_atom_ids()) == 0:
                 return BuildResult.NO_FAILURES
             return BuildResult.FAILURE
         return None
@@ -424,20 +444,42 @@ class Build(object):
         Once a build is complete, certain tasks can be performed asynchronously.
         """
         self._create_build_artifact()
-        self._logger.debug('Postbuild tasks completed for build {}', self.build_id())
+        self._delete_temporary_build_artifact_files()
         self._postbuild_tasks_are_finished = True
+        self._state_machine.trigger(BuildEvent.POSTBUILD_TASKS_COMPLETE)
 
     def _create_build_artifact(self):
         self._build_artifact = BuildArtifact(self._build_results_dir())
         self._build_artifact.generate_failures_file()
         self._build_artifact.write_timing_data(self._timing_file_path, self._read_subjob_timings_from_results())
-        self._artifacts_archive_file = app.util.fs.compress_directory(self._build_results_dir(), 'results.tar.gz')
+        self._artifacts_archive_file = app.util.fs.compress_directory(self._build_results_dir(),
+                                                                      BuildArtifact.ARTIFACT_FILE_NAME)
+
+    def _delete_temporary_build_artifact_files(self):
+        """
+        Delete the temporary build result files that are no longer needed, due to the creation of the
+        build artifact tarball.
+
+        ONLY call this method after _create_build_artifact() has completed. Otherwise we have lost the build results.
+        """
+        build_result_dir = self._build_results_dir()
+        start_time = time.time()
+        for path in os.listdir(build_result_dir):
+            # The build result tar-ball is also stored in this same directory, so we must not delete it.
+            if path == BuildArtifact.ARTIFACT_FILE_NAME:
+                continue
+            full_path = os.path.join(build_result_dir, path)
+            # Do NOT use app.util.fs.async_delete() here. That call will generate a temp directory for every
+            # atom, which can be in the thousands per build, and can lead to running up against the ulimit -Hn.
+            if os.path.isdir:
+                shutil.rmtree(full_path, ignore_errors=True)
+            else:
+                os.remove(full_path)
+        end_time = time.time() - start_time
+        self._logger.info('Completed deleting artifact files for {}, took {:.1f} seconds.', self._build_id, end_time)
 
     def _build_results_dir(self):
-        return os.path.join(
-            Configuration['results_directory'],
-            str(self.build_id()),
-        )
+        return BuildArtifact.build_artifact_directory(self.build_id(), result_root=Configuration['results_directory'])
 
     def _generate_unique_symlink_path_for_build_repo(self):
         """
@@ -447,12 +489,13 @@ class Build(object):
         return os.path.join(Configuration['build_symlink_directory'], str(uuid.uuid4()))
 
 
-class BuildStatus(str, Enum):
+class BuildStatus(str, Enum):  # WIP(joey): Remove this class.
     """
     An enum of possible build statuses. Also inherits from string to allow comparisons with other strings (which is
     useful for client code in parsing API responses).
     """
     QUEUED = 'QUEUED'
+    PREPARED = 'PREPARED'
     BUILDING = 'BUILDING'
     FINISHED = 'FINISHED'
     ERROR = 'ERROR'

@@ -32,12 +32,6 @@ class BaseConfigLoader(object):
         conf.set('main_executable_path', sys.argv[0])
         conf.set('version', autoversioning.get_version())
 
-        # Where the clusterrunner service will save the process id to. These settings are set in base_config_loader
-        # and not in master_config_loader and slave_config_loader because CLI tools such as "clusterrunner stop"
-        # needs to read in these settings.
-        conf.set('master_pid_file', '/tmp/.clusterrunner_master.pid')
-        conf.set('slave_pid_file', '/tmp/.clusterrunner_slave.pid')
-
         # If the user installed ClusterRunner manually, the directories used by the manual install should take
         # precedence over the default install location (the home directory).
         static_configured_base_directory = join('/var', 'lib', 'clusterrunner')
@@ -52,6 +46,12 @@ class BaseConfigLoader(object):
         # the path to the clusterrunner config file. We have to specify this in defaults since it cannot depend on
         # values in the file it refers to.
         conf.set('config_file', join(base_directory, 'clusterrunner.conf'))
+
+        # Where the clusterrunner service will save the process id to. These settings are set in base_config_loader
+        # and not in master_config_loader and slave_config_loader because CLI tools such as "clusterrunner stop"
+        # needs to read in these settings.
+        conf.set('master_pid_file', join(base_directory, '.clusterrunner_master.pid'))
+        conf.set('slave_pid_file', join(base_directory, '.clusterrunner_slave.pid'))
 
         # contains symlinks to build-specific repos
         conf.set('build_symlink_directory', join('/tmp', 'clusterrunner_build_symlinks'))
@@ -82,8 +82,19 @@ class BaseConfigLoader(object):
         # CORS support - a regex to match against allowed API request origins, or None to disable CORS
         conf.set('cors_allowed_origins_regex', None)
 
-        # Clone a project from master (over SSH)
-        conf.set('clone_project_from_master', False)
+        # Helper executables
+        bin_dir = join(root_directory, 'bin')
+        conf.set('git_askpass_exe', join(bin_dir, 'git_askpass.sh'))
+        conf.set('git_ssh_exe', join(bin_dir, 'git_ssh.sh'))
+
+        # How slaves get the project
+        # Slaves would get the project from master if set to True. Otherwise it would just get the project in
+        # the same way how the master gets the project.
+        conf.set('get_project_from_master', False)
+
+        # Should we have shallow or full clones of the repository?
+        # The master must have full clones, as slaves fetch from the master, and one cannot fetch from a shallow clone.
+        conf.set('shallow_clones', False)
 
     def configure_postload(self, conf):
         """
@@ -129,7 +140,7 @@ class BaseConfigLoader(object):
             'eventlog_filename',
             'git_strict_host_key_checking',
             'cors_allowed_origins_regex',
-            'clone_project_from_master'
+            'get_project_from_master',
         ]
 
     def _load_section_from_config_file(self, config, config_filename, section):
@@ -171,7 +182,7 @@ class BaseConfigLoader(object):
 
         if isinstance(default_value, bool):  # bool is a subclass of int so should be checked first
             value_mapping = {'true': True, 'false': False}
-            if not isinstance(value, str) and not value.lower() in value_mapping.keys():
+            if not isinstance(value, str) and value.lower() not in value_mapping.keys():
                 raise InvalidConfigError('The value for {} should be True or False, but it is "{}"'.format(key, value))
             config.set(key, value_mapping[value.lower()])
 

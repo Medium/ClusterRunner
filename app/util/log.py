@@ -1,20 +1,23 @@
 from collections import defaultdict
-import logbook
-from logbook import Logger, NullHandler, RotatingFileHandler, StreamHandler
-import logbook.compat
 import logging
 import os
 import sys
-from termcolor import colored
 import threading
+
+import logbook
+from logbook import Logger, NullHandler, RotatingFileHandler, StreamHandler
+import logbook.compat
+from termcolor import colored
 
 from app.util import autoversioning, fs
 from app.util.conf.configuration import Configuration
+from app.util.session_id import SessionId
 
 
 # This custom format string takes care of setting field widths to make logs more aligned and readable.
 _LOG_FORMAT_STRING = (
     '[{record.time!s:.23}] '             # 23 chars of date and time (omits last 3 digits of microseconds)
+    '{record.process} '                  # pid of process
     '{record.level_name:7} '             # log level - min field width = 7
     '{record.thread_name:15.15} '        # thread name - min and max field width = 15
     '{record.channel:15.15} '            # module name - min and max field width = 15
@@ -59,7 +62,7 @@ def get_logger(logger_name=None):
     :return: The logger instance
     :rtype: logbook.Logger
     """
-    name_without_package = logger_name.rsplit('.', 1)[-1]  # e.g., converts "project_type.docker" to "docker"
+    name_without_package = logger_name.rsplit('.', 1)[-1]  # e.g., converts "project_type.git" to "git"
     return Logger(name_without_package)
 
 
@@ -121,7 +124,7 @@ def configure_logging(log_level=None, log_file=None, simplified_console_logs=Fal
             event_handler.log_application_summary()
 
 
-def application_summary(logfile_count):
+def application_summary(logfile_count):  # todo: move this method to app_info.py
     """
     Return a string summarizing general info about the application. This will be output at the start of every logfile.
 
@@ -131,8 +134,9 @@ def application_summary(logfile_count):
     separator = '*' * 50
     summary_lines = [
         ' ClusterRunner',
-        '  * Version: {}'.format(autoversioning.get_version()),
-        '  * PID:     {}'.format(os.getpid()),
+        '  * Version:    {}'.format(autoversioning.get_version()),
+        '  * PID:        {}'.format(os.getpid()),
+        '  * Session id: {}'.format(SessionId.get()),
     ]
     if logfile_count > 1:
         summary_lines.append('  * Logfile count: {}'.format(logfile_count))

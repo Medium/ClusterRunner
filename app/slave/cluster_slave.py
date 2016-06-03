@@ -1,9 +1,11 @@
 from enum import Enum
 from queue import Queue
-import requests
 import sys
 import time
 
+import requests
+
+from app.common.cluster_service import ClusterService
 from app.project_type.project_type import SetupFailureError
 from app.slave.subjob_executor import SubjobExecutor
 from app.util import analytics, log, util
@@ -11,12 +13,13 @@ from app.util.exceptions import BadRequestError
 from app.util.network import Network
 from app.util.safe_thread import SafeThread
 from app.util.secret import Secret
+from app.util.session_id import SessionId
 from app.util.single_use_coin import SingleUseCoin
 from app.util.unhandled_exception_handler import UnhandledExceptionHandler
 from app.util.url_builder import UrlBuilder
 
 
-class ClusterSlave(object):
+class ClusterSlave(ClusterService):
 
     API_VERSION = 'v1'
 
@@ -51,6 +54,7 @@ class ClusterSlave(object):
         self._project_type = None  # this will be instantiated during build setup
         self._current_build_id = None
         self._build_teardown_coin = None
+        self._base_executor_index = None
 
     def api_representation(self):
         """
@@ -64,6 +68,7 @@ class ClusterSlave(object):
             'current_build_id': self._current_build_id,
             'slave_id': self._slave_id,
             'executors': executors_representation,
+            'session_id': SessionId.get(),
         }
 
     def get_status(self):
@@ -173,11 +178,9 @@ class ClusterSlave(object):
         for executor in self.executors_by_id.values():
             executor.kill()
 
-        if not self._project_type:
-            return  # There is no build to tear down! (Slave is idle.)
-
-        if not self._build_teardown_coin.spend():
-            raise BuildTeardownError('Build teardown process was requested more than once for the same build.')
+        # Order matters! Spend the coin if it has been initialized.
+        if not self._build_teardown_coin or not self._build_teardown_coin.spend() or not self._project_type:
+            return  # There is no build to tear down or teardown is already in progress.
 
         self._logger.info('Executing teardown for build {}.', self._current_build_id)
         # todo: Catch exceptions raised during teardown_build so we don't skip notifying master of idle/disconnect.
@@ -185,6 +188,7 @@ class ClusterSlave(object):
         self._logger.info('Build teardown complete for build {}.', self._current_build_id)
         self._current_build_id = None
         self._project_type = None
+        self._base_executor_index = None
 
     def _send_master_idle_notification(self):
         if not self._is_master_responsive():
@@ -224,6 +228,7 @@ class ClusterSlave(object):
         data = {
             'slave': '{}:{}'.format(self.host, self.port),
             'num_executors': self._num_executors,
+            'session_id': SessionId.get()
         }
         response = self._network.post(connect_url, data=data)
         self._slave_id = int(response.json().get('slave_id'))
@@ -252,14 +257,13 @@ class ClusterSlave(object):
 
         return is_responsive
 
-    def start_working_on_subjob(self, build_id, subjob_id, subjob_artifact_dir, atomic_commands):
+    def start_working_on_subjob(self, build_id, subjob_id, atomic_commands):
         """
         Begin working on a subjob with the given build id and subjob id. This just starts the subjob execution
         asynchronously on a separate thread.
 
         :type build_id: int
         :type subjob_id: int
-        :type subjob_artifact_dir: str
         :type atomic_commands: list[str]
         :return: The text to return in the API response.
         :rtype: dict[str, int]
@@ -274,7 +278,7 @@ class ClusterSlave(object):
         # Start a thread to execute the job (after waiting for setup to complete)
         SafeThread(
             target=self._execute_subjob,
-            args=(build_id, subjob_id, executor, subjob_artifact_dir, atomic_commands),
+            args=(build_id, subjob_id, executor, atomic_commands),
             name='Bld{}-Sub{}'.format(build_id, subjob_id),
         ).start()
 
@@ -282,7 +286,7 @@ class ClusterSlave(object):
                           subjob_id)
         return {'executor_id': executor.id}
 
-    def _execute_subjob(self, build_id, subjob_id, executor, subjob_artifact_dir, atomic_commands):
+    def _execute_subjob(self, build_id, subjob_id, executor, atomic_commands):
         """
         This is the method for executing a subjob asynchronously. This performs the work required by executing the
         specified command, then does a post back to the master results endpoint to signal that the work is done.
@@ -290,14 +294,12 @@ class ClusterSlave(object):
         :type build_id: int
         :type subjob_id: int
         :type executor: SubjobExecutor
-        :type subjob_artifact_dir: str
         :type atomic_commands: list[str]
         """
         subjob_event_data = {'build_id': build_id, 'subjob_id': subjob_id, 'executor_id': executor.id}
 
         analytics.record_event(analytics.SUBJOB_EXECUTION_START, **subjob_event_data)
-        results_file = executor.execute_subjob(build_id, subjob_id, subjob_artifact_dir, atomic_commands,
-                                               self._base_executor_index)
+        results_file = executor.execute_subjob(build_id, subjob_id, atomic_commands, self._base_executor_index)
         analytics.record_event(analytics.SUBJOB_EXECUTION_FINISH, **subjob_event_data)
 
         results_url = self._master_api.url('build', build_id, 'subjob', subjob_id, 'result')
@@ -324,7 +326,9 @@ class ClusterSlave(object):
                                       secret=Secret.get(), error_on_failure=True)
 
     def kill(self):
-        # TODO(dtran): Kill the threads and this server more gracefully
+        """
+        Exits without error.
+        """
         sys.exit(0)
 
 
@@ -333,11 +337,8 @@ class SlaveState(str, Enum):
     An enum of possible slave states. Also inherits from string to allow comparisons with other strings (which is
     useful when including these values in API responses).
     """
-    DISCONNECTED = 'DISCONNECTED'
-    IDLE = 'IDLE'
-    SETUP_COMPLETED = 'SETUP_COMPLETE'
-    SETUP_FAILED = 'SETUP_FAILED'
-
-
-class BuildTeardownError(Exception):
-    pass
+    DISCONNECTED = 'DISCONNECTED'  # The master is not in communication with the slave.
+    SHUTDOWN = 'SHUTDOWN'  # The slave will not accept additional builds, and will disconnect when finished.
+    IDLE = 'IDLE'  # The slave is waiting for a build.
+    SETUP_COMPLETED = 'SETUP_COMPLETE'  # The slave has completed a build's setup and is waiting for subjobs.
+    SETUP_FAILED = 'SETUP_FAILED'  # A build's setup did not complete successfully, the slave is now stuck.

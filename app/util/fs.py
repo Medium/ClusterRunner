@@ -2,7 +2,8 @@ import os
 import shutil
 import tarfile
 import tempfile
-import subprocess
+
+from app.util.process_utils import Popen_with_delayed_expansion
 
 
 def async_delete(path):
@@ -20,7 +21,8 @@ def async_delete(path):
     """
     new_temp_path = tempfile.mkdtemp(prefix='async_delete_directory')
     shutil.move(path, new_temp_path)
-    subprocess.Popen(['rm', '-rf', new_temp_path])
+    # TODO: make the following command cross-platform.
+    Popen_with_delayed_expansion(['rm', '-rf', new_temp_path])
 
 
 def create_dir(dir_path, mode=None):
@@ -114,14 +116,3 @@ def compress_directories(target_dirs_to_archive_paths, tarfile_path):
             target_dir = os.path.normpath(dir_path)
 
             tar.add(target_dir, arcname=archive_name)
-
-
-def remove_invalid_path_characters(path):
-    """
-    :param path: the path that may contain invalid characters
-    :type path: str
-    :return: the path with the invalid characters removed
-    :rtype: str
-    """
-    # Replace colons and dashes
-    return path.replace(':', '').replace('-', '')
