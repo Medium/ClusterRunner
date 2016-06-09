@@ -1,10 +1,12 @@
-import requests
-from subprocess import Popen, DEVNULL
+from subprocess import DEVNULL
 import time
+
+import requests
 
 from app.util.conf.configuration import Configuration
 from app.util.log import get_logger
 from app.util.network import Network
+from app.util.process_utils import Popen_with_delayed_expansion
 from app.util.url_builder import UrlBuilder
 from app.util import poll
 
@@ -33,9 +35,7 @@ class ServiceRunner(object):
         self._logger.info('Running master on {}'.format(self._master_url))
         if self.is_master_up():
             return
-        cmd = '{} master --port {} &'.format(
-            self._main_executable,
-            self._port(self._master_url))
+        cmd = [self._main_executable, 'master', '--port', self._port(self._master_url)]
 
         self._run_service(cmd, self._master_url)
 
@@ -55,12 +55,10 @@ class ServiceRunner(object):
         :return:
         """
         self._logger.info('Running slave')
-        cmd = '{} slave --master-url {} '.format(
-            self._main_executable,
-            self._master_url)
+        cmd = [self._main_executable, 'slave', '--master-url', self._master_url]
         if port is not None:
-            cmd += '--port {} '.format(str(port))
-        cmd += '&'
+            cmd.extend(['--port', str(port)])
+
         self._run_service(cmd)
 
     def block_until_build_queue_empty(self, timeout=60):
@@ -87,7 +85,7 @@ class ServiceRunner(object):
             raise Exception('Master service did not become idle before timeout.')
 
     def kill(self):
-        self._run_service('{} stop'.format(self._main_executable))
+        self._run_service([self._main_executable, 'stop'])
 
     def _run_service(self, cmd, service_url=None):
         """
@@ -96,9 +94,10 @@ class ServiceRunner(object):
         :param cmd: shell command for running the service as a background process
         :return:
         """
+        print('running cmd: {}'.format(cmd))
         if service_url is not None and self.is_up(service_url):
             return
-        Popen(cmd, stdout=DEVNULL, shell=True)
+        Popen_with_delayed_expansion(cmd, stdout=DEVNULL)
         if service_url is not None and not self.is_up(service_url, timeout=10):
             raise ServiceRunError("Failed to run service on {}.".format(service_url))
 

@@ -3,6 +3,7 @@ import sys
 from threading import Thread
 from unittest.mock import call, mock_open, MagicMock
 
+from app.util import process_utils
 from test.framework.base_unit_test_case import BaseUnitTestCase
 from test.framework.comparators import AnyStringMatching
 from app.util.unhandled_exception_handler import UnhandledExceptionHandler
@@ -27,6 +28,16 @@ class TestUnhandledExceptionHandler(BaseUnitTestCase):
             callback.assert_called_once_with(arg_i)  # Each callback should be executed once with the correct args.
         exception_was_logged = self.log_handler.has_error('Unhandled exception handler caught exception.')
         self.assertTrue(exception_was_logged, 'Exception handler should log exceptions.')
+
+    def test_handles_platform_does_not_support_SIGINFO(self):
+        UnhandledExceptionHandler.reset_singleton()
+        mock_signal = self.patch('app.util.unhandled_exception_handler.signal')
+
+        def register_signal_handler(sig, _):
+            if sig == process_utils.SIGINFO:
+                raise ValueError
+        mock_signal.signal.side_effect = register_signal_handler
+        UnhandledExceptionHandler.singleton()
 
     def test_exceptions_in_teardown_callbacks_are_caught_and_logged(self):
         an_evil_callback = MagicMock(side_effect=Exception)
@@ -135,7 +146,7 @@ class TestUnhandledExceptionHandler(BaseUnitTestCase):
     def test_application_info_dump_signal_handler_writes_to_file(self):
         open_mock = mock_open()
         self.patch('app.util.unhandled_exception_handler.open', new=open_mock, create=True)
-        self.exception_handler._application_info_dump_signal_handler(UnhandledExceptionHandler.SIGINFO, MagicMock())
+        self.exception_handler._application_info_dump_signal_handler(process_utils.SIGINFO, MagicMock())
 
         handle = open_mock()
         assert handle.write.called

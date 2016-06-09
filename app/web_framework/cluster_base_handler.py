@@ -5,9 +5,13 @@ import tornado.web
 
 from app.util import log
 from app.util.conf.configuration import Configuration
-from app.util.exceptions import AuthenticationError, BadRequestError, ItemNotFoundError, ItemNotReadyError
+from app.util.exceptions import AuthenticationError, BadRequestError, ItemNotFoundError, ItemNotReadyError, PreconditionFailedError
 from app.util.network import ENCODED_BODY
+from app.util.session_id import SessionId
 
+
+# pylint: disable=attribute-defined-outside-init
+#   Handler classes are not designed to have __init__ overridden.
 
 class ClusterBaseHandler(tornado.web.RequestHandler):
     """
@@ -23,6 +27,7 @@ class ClusterBaseHandler(tornado.web.RequestHandler):
         BadRequestError: http.client.BAD_REQUEST,
         AuthenticationError: http.client.UNAUTHORIZED,
         ItemNotFoundError: http.client.NOT_FOUND,
+        PreconditionFailedError: http.client.PRECONDITION_FAILED,
     }
 
     def _handle_request_exception(self, ex):
@@ -69,6 +74,8 @@ class ClusterBaseAPIHandler(ClusterBaseHandler):
         """
         Called at the beginning of a request before  `get`/`post`/etc.
         """
+        self._check_expected_session_id()
+
         # Decode an encoded body, if present. Otherwise fall back to decoding the raw request body. See the comments in
         # the util.network.Network class for more information about why we're doing this.
         try:
@@ -77,6 +84,26 @@ class ClusterBaseAPIHandler(ClusterBaseHandler):
 
         except ValueError as ex:
             raise BadRequestError('Invalid JSON in request body.') from ex
+
+    def _check_expected_session_id(self):
+        """
+        If the request has specified the session id, which is optional, and the session id does not match
+        the current instance's session id, then the requester is asking for a resource that has expired and
+        no longer exists.
+        """
+        # An expected session header in a *request* should be declared using the "Expected-Session-Id" header
+        # but for legacy support an expected header can also be specified with the "Session-Id" header.
+        session_id = self.request.headers.get(SessionId.SESSION_HEADER_KEY) \
+            or self.request.headers.get(SessionId.EXPECTED_SESSION_HEADER_KEY)
+
+        if session_id is not None and session_id != SessionId.get():
+            raise PreconditionFailedError('Specified session id: {} has expired and is invalid.'.format(session_id))
+
+    def options(self, *args, **kwargs):
+        """
+        Enable OPTIONS on all endpoints by default (preflight AJAX requests requires this).
+        """
+        self.write({})
 
     def get(self, *args, **kwargs):
         """
@@ -114,10 +141,16 @@ class ClusterBaseAPIHandler(ClusterBaseHandler):
 
     def set_default_headers(self):
         self.set_header('Content-Type', 'application/json')
+        self.set_header(SessionId.SESSION_HEADER_KEY, SessionId.get())
 
         request_origin = self.request.headers.get('Origin')  # usually only set when making API request from a browser
         if request_origin and self._is_request_origin_allowed(request_origin):
             self.set_header('Access-Control-Allow-Origin', request_origin)
+            self.set_header(
+                'Access-Control-Allow-Headers',
+                'Content-Type, Accept, X-Requested-With, Session, Session-Id',
+            )
+            self.set_header('Access-Control-Allow-Methods', 'GET')
 
     def _is_request_origin_allowed(self, request_origin):
         """

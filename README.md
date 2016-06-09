@@ -1,11 +1,13 @@
 [![Project Status](http://opensource.box.com/badges/active.svg)](http://opensource.box.com/badges)
 [![Build Status](https://travis-ci.org/box/ClusterRunner.svg?branch=master)](https://travis-ci.org/box/ClusterRunner)
+[![Build Status](https://ci.appveyor.com/api/projects/status/j7liyv4uuq5m936q/branch/master?svg=true)](https://ci.appveyor.com/project/aptxkid/clusterrunner)
+[![Coverage Status](https://coveralls.io/repos/box/ClusterRunner/badge.svg?branch=master)](https://coveralls.io/r/box/ClusterRunner?branch=master)
 
 # ClusterRunner
 
 ClusterRunner makes it easy to execute test-suites across your infrastructure in the fastest and most efficient way possible.
 
-By using cluster runner in your testing pipeline, you will be able to easily:
+By using ClusterRunner in your testing pipeline, you will be able to easily:
 
 - Make linear (i.e.: single-threaded) test jobs run in parallel
 - Consistently utilize 100% of your testing infrastructure

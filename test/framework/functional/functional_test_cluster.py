@@ -1,13 +1,19 @@
+import requests
+
 from contextlib import suppress
 import functools
+import os
 from os.path import dirname, join, realpath
-import requests
 from subprocess import DEVNULL, Popen
 import sys
+import shutil
 import tempfile
 
 from app.client.cluster_api_client import ClusterMasterAPIClient, ClusterSlaveAPIClient
 from app.util import log, poll, process_utils
+from app.util.conf.base_config_loader import BASE_CONFIG_FILE_SECTION
+from app.util.conf.config_file import ConfigFile
+from app.util.secret import Secret
 
 
 class FunctionalTestCluster(object):
@@ -18,14 +24,11 @@ class FunctionalTestCluster(object):
     _MASTER_PORT = 43000
     _SLAVE_START_PORT = 43001
 
-    def __init__(self, conf_file_path, verbose=False):
+    def __init__(self, verbose=False):
         """
-        :param conf_file_path: The path to the clusterrunner.conf file that this cluster's services should use
-        :type conf_file_path: str
         :param verbose: If true, output from the master and slave processes is allowed to pass through to stdout.
         :type verbose: bool
         """
-        self._conf_file_path = conf_file_path
         self._verbose = verbose
         self._logger = log.get_logger(__name__)
 
@@ -36,8 +39,48 @@ class FunctionalTestCluster(object):
         self._slave_eventlog_names = []
         self._next_slave_port = self._SLAVE_START_PORT
 
-        clusterrunner_repo_dir = dirname(dirname(dirname(dirname(realpath(__file__)))))
-        self._app_executable = join(clusterrunner_repo_dir, 'main.py')
+        self._clusterrunner_repo_dir = dirname(dirname(dirname(dirname(realpath(__file__)))))
+        self._app_executable = join(self._clusterrunner_repo_dir, 'main.py')
+
+        self._master_app_base_dir = None
+        self._slaves_app_base_dirs = []
+
+    @property
+    def master_app_base_dir(self):
+        return self._master_app_base_dir
+
+    @property
+    def slaves_app_base_dirs(self):
+        return self._slaves_app_base_dirs
+
+    def _create_test_config_file(self, base_dir_sys_path):
+        """
+        Create a temporary conf file just for this test.
+
+        :param base_dir_sys_path: Sys path of the base app dir
+        :type base_dir_sys_path: unicode
+
+        :return: The path to the conf file
+        :rtype: str
+        """
+        # Copy default conf file to tmp location
+        self._conf_template_path = join(self._clusterrunner_repo_dir, 'conf', 'default_clusterrunner.conf')
+        # Create the conf file inside base dir so we can clean up the test at the end just by removing the base dir
+        test_conf_file_path = tempfile.NamedTemporaryFile(dir=base_dir_sys_path).name
+        shutil.copy(self._conf_template_path, test_conf_file_path)
+        os.chmod(test_conf_file_path, ConfigFile.CONFIG_FILE_MODE)
+        conf_file = ConfigFile(test_conf_file_path)
+
+        # Set custom conf file values for this test
+        conf_values_to_set = {
+            'secret': Secret.get(),
+            'base_directory': base_dir_sys_path,
+            'max_log_file_size': 1024 * 5,
+        }
+        for conf_key, conf_value in conf_values_to_set.items():
+            conf_file.write_value(conf_key, conf_value, BASE_CONFIG_FILE_SECTION)
+
+        return test_conf_file_path
 
     def start_master(self):
         """
@@ -49,7 +92,7 @@ class FunctionalTestCluster(object):
         self._start_master_process()
         return self.master_api_client
 
-    def start_slaves(self, num_slaves, num_executors_per_slave=1):
+    def start_slaves(self, num_slaves, num_executors_per_slave=1, start_port=None):
         """
         Start slave services for this cluster.
 
@@ -57,10 +100,13 @@ class FunctionalTestCluster(object):
         :type num_slaves: int
         :param num_executors_per_slave: The number of executors that each slave will be configured to use
         :type num_executors_per_slave: int
+        :param start_port: The port number of the first slave to launch. If None, default to the current counter.
+            Subsequent slaves will be started on subsequent port numbers.
+        :type start_port: int | None
         :return: A list of API client objects through which API calls to each slave can be made
         :rtype: list[ClusterSlaveAPIClient]
         """
-        new_slaves = self._start_slave_processes(num_slaves, num_executors_per_slave)
+        new_slaves = self._start_slave_processes(num_slaves, num_executors_per_slave, start_port)
         return [ClusterSlaveAPIClient(base_api_url=slave.url) for slave in new_slaves]
 
     def start_slave(self, **kwargs):
@@ -84,8 +130,8 @@ class FunctionalTestCluster(object):
         """
         Start the master process on localhost.
 
-        :return: A ClusterService object which wraps the master service's Popen instance
-        :rtype: ClusterService
+        :return: A ClusterController object which wraps the master service's Popen instance
+        :rtype: ClusterController
         """
         if self.master:
             raise RuntimeError('Master service was already started for this cluster.')
@@ -95,6 +141,8 @@ class FunctionalTestCluster(object):
             popen_kwargs.update({'stdout': DEVNULL, 'stderr': DEVNULL})  # hide output of master process
 
         self._master_eventlog_name = tempfile.NamedTemporaryFile(delete=False).name
+        self._master_app_base_dir = tempfile.TemporaryDirectory()
+        master_config_file_path = self._create_test_config_file(self._master_app_base_dir.name)
         master_hostname = 'localhost'
         master_cmd = [
             sys.executable,
@@ -102,11 +150,11 @@ class FunctionalTestCluster(object):
             'master',
             '--port', str(self._MASTER_PORT),
             '--eventlog-file', self._master_eventlog_name,
-            '--config-file', self._conf_file_path,
+            '--config-file', master_config_file_path,
         ]
 
         # Don't use shell=True in the Popen here; the kill command might only kill "sh -c", not the actual process.
-        self.master = ClusterService(
+        self.master = ClusterController(
             Popen(master_cmd, **popen_kwargs),
             host=master_hostname,
             port=self._MASTER_PORT,
@@ -127,7 +175,7 @@ class FunctionalTestCluster(object):
         if not master_is_ready:
             raise TestClusterTimeoutError('Master service did not start up before timeout.')
 
-    def _start_slave_processes(self, num_slaves, num_executors_per_slave):
+    def _start_slave_processes(self, num_slaves, num_executors_per_slave, start_port=None):
         """
         Start the slave processes on localhost.
 
@@ -135,12 +183,18 @@ class FunctionalTestCluster(object):
         :type num_slaves: int
         :param num_executors_per_slave: The number of executors to start each slave with
         :type num_executors_per_slave: int
-        :return: A list of ClusterService objects which wrap the slave services' Popen instances
-        :rtype: list[ClusterService]
+        :param start_port: The port number of the first slave to launch. If None, default to the current counter.
+            Subsequent slaves will be started on subsequent port numbers.
+        :type start_port: int | None
+        :return: A list of ClusterController objects which wrap the slave services' Popen instances
+        :rtype: list[ClusterController]
         """
         popen_kwargs = {}
         if not self._verbose:
             popen_kwargs.update({'stdout': DEVNULL, 'stderr': DEVNULL})  # hide output of slave process
+
+        if start_port is not None:
+            self._next_slave_port = start_port
 
         slave_hostname = 'localhost'
         new_slaves = []
@@ -150,6 +204,9 @@ class FunctionalTestCluster(object):
 
             slave_eventlog = tempfile.NamedTemporaryFile().name  # each slave writes to its own file to avoid collision
             self._slave_eventlog_names.append(slave_eventlog)
+            slave_base_app_dir = tempfile.TemporaryDirectory()
+            self._slaves_app_base_dirs.append(slave_base_app_dir)
+            slave_config_file_path = self._create_test_config_file(slave_base_app_dir.name)
 
             slave_cmd = [
                 sys.executable,
@@ -159,11 +216,11 @@ class FunctionalTestCluster(object):
                 '--num-executors', str(num_executors_per_slave),
                 '--master-url', '{}:{}'.format(self.master.host, self.master.port),
                 '--eventlog-file', slave_eventlog,
-                '--config-file', self._conf_file_path,
+                '--config-file', slave_config_file_path,
             ]
 
             # Don't use shell=True in the Popen here; the kill command may only kill "sh -c", not the actual process.
-            new_slaves.append(ClusterService(
+            new_slaves.append(ClusterController(
                 Popen(slave_cmd, **popen_kwargs),
                 host=slave_hostname,
                 port=slave_port,
@@ -239,7 +296,7 @@ class FunctionalTestCluster(object):
         Kill the master process and return an object wrapping the return code, stdout, and stderr.
 
         :return: The killed master service with return code, stdout, and stderr set.
-        :rtype: ClusterService
+        :rtype: ClusterController
         """
         if self.master:
             self.master.kill()
@@ -247,16 +304,18 @@ class FunctionalTestCluster(object):
         master, self.master = self.master, None
         return master
 
-    def kill_slaves(self):
+    def kill_slaves(self, kill_gracefully=True):
         """
         Kill all the slave processes and return objects wrapping the return code, stdout, and stderr of each process.
 
+        :param kill_gracefully: If True do a gracefull kill (sigterm), else do a sigkill
+        :type kill_gracefully: bool
         :return: The killed slave services with return code, stdout, and stderr set.
-        :rtype: list[ClusterService]
+        :rtype: list[ClusterController]
         """
         for service in self.slaves:
             if service:
-                service.kill()
+                service.kill(kill_gracefully)
 
         slaves, self.slaves = self.slaves, []
         return slaves
@@ -266,15 +325,27 @@ class FunctionalTestCluster(object):
         Kill the master and all the slave subprocesses.
 
         :return: The killed master and killed slave services with return code, stdout, and stderr set.
-        :rtype: list[ClusterService]
+        :rtype: list[ClusterController]
         """
         services = [self.kill_master()]
         services.extend(self.kill_slaves())
         services = [service for service in services if service is not None]  # remove `None` values from list
         return services
 
+    def block_until_n_slaves_dead(self, num_slaves, timeout):
 
-class ClusterService(object):
+        def are_n_slaves_dead(n):
+            dead_slaves = [slave for slave in self.slaves if not slave.is_alive()]
+            return len(dead_slaves) == n
+
+        def are_slaves_dead():
+            are_n_slaves_dead(num_slaves)
+
+        slaves_died_within_timeout = poll.wait_for(are_slaves_dead, timeout_seconds=timeout)
+        return slaves_died_within_timeout
+
+
+class ClusterController(object):
     """
     A data container that wraps a process and holds metadata about that process. This is useful for wrapping up data
     relating to the various services started by the FunctionalTestCluster (master, slaves, etc.).
@@ -296,19 +367,33 @@ class ClusterService(object):
         self.stdout = None
         self.stderr = None
 
-    def kill(self):
+        self._logger = log.get_logger(__name__)
+
+    def kill(self, kill_gracefully=True):
         """
         Kill the underlying process for this service object and set the return code and output.
 
+        :param kill_gracefully: If True do a gracefull kill (sigterm), else do a sigkill
+        :type kill_gracefully: bool
         :return: The return code, stdout, and stderr of the process
         :rtype: (int, str, str)
         """
-        self.return_code, self.stdout, self.stderr = process_utils.kill_gracefully(self.process, timeout=15)
+        if kill_gracefully:
+            self._logger.notice('Gracefully killing process with pid {}...'.format(self.process.pid))
+            output = process_utils.kill_gracefully(self.process, timeout=15)
+        else:
+            self._logger.notice('Hard killing process with pid {}...'.format(self.process.pid))
+            output = process_utils.kill_hard(self.process)
+
+        self.return_code, self.stdout, self.stderr = output
         return self.return_code, self.stdout, self.stderr
 
     @property
     def url(self):
         return 'http://{}:{}'.format(self.host, self.port)
+
+    def is_alive(self):
+        return self.process.poll() is None
 
 
 class TestClusterTimeoutError(Exception):

@@ -3,33 +3,54 @@ import inspect
 import os
 import re
 import signal
-from subprocess import Popen, TimeoutExpired
+from subprocess import TimeoutExpired, STDOUT
 from tempfile import TemporaryFile
 from threading import Event
 import time
 
 from app.master.cluster_runner_config import ClusterRunnerConfig
+from app.master.job_config import JobConfig
 from app.util import log
 from app.util.conf.configuration import Configuration
+from app.util.process_utils import Popen_with_delayed_expansion, get_environment_variable_setter_command
 
 
 class ProjectType(object):
 
-    def __init__(self, config=None, job_name=None, remote_files=None):
+    def __init__(self, config=None, job_name=None, remote_files=None, atoms_override=None):
         """
-        :param config: A yaml string representing a cluster_runner.yaml file
-        :type config: str | None
+        :param config: A dictionary containing the job configuration for a single clusterrunner job, with the
+            top-level keys being 'commands', 'atomizers', etc.
+        :type config: dict | None
         :type job_name: str | None
         :param remote_files: key-value pairs of where the key is the output_file and the value is the url
         :type remote_files: dict[str, str] | None
+        :param atoms_override: the list of overriden atoms specified from the build request. If this parameter
+            is specified, then the atomization step is skipped.
+        :type atoms_override: list[str]
         """
         self.project_directory = ''
+        self._atoms_override = atoms_override
         self._config = config
         self._job_name = job_name
         self._remote_files = remote_files if remote_files else {}
-
         self._logger = log.get_logger(__name__)
         self._kill_event = Event()
+        self._job_config = None
+
+    @property
+    def atoms_override(self):
+        """
+        :return: The list of atom command strings that were specified in the build request. This is an optional
+            build request parameter that is defaulted to 'None', in which case atomization still occurs during
+            build preparation.
+        :rtype: list[str]|None
+        """
+        return self._atoms_override
+
+    @property
+    def job_name(self):
+        return self._job_name
 
     def slave_param_overrides(self):
         """
@@ -46,19 +67,26 @@ class ProjectType(object):
         Return the job config found in this project_type and matching any job_name parameter passed in
         :rtype: JobConfig
         """
-        config = ClusterRunnerConfig(self._get_config_contents())
-        return config.get_job_config(self._job_name)
+        if not self._job_config:
+            # If the config was specified in the POST request, then there is no need to parse clusterrunner.yaml
+            if self._config is not None:
+                self._job_config = JobConfig.construct_from_dict(self._job_name, self._config)
+                return self._job_config
 
-    def _get_config_contents(self):
+            # Get job configuration from clusterrunner.yaml in repo.
+            config = ClusterRunnerConfig(self._get_clusterrunner_config_file_contents())
+            self._job_config = config.get_job_config(self._job_name)
+
+        return self._job_config
+
+    def _get_clusterrunner_config_file_contents(self):
         """
-        Default method for retriving the contents of cluster_runner.yaml.  Override this in project types using a
-        different method
-        :return: The contents of cluster_runner.yaml
+        Method for retrieving the contents of clusterrunner.yaml. Override this in project types using a different
+        method.
+
+        :return: The contents of clusterrunner.yaml
         :rtype: str
         """
-        if self._config is not None:
-            return self._config
-
         yaml_file = os.path.join(self.project_directory, Configuration['project_yaml_filename'])
         if not os.path.exists(yaml_file):
             raise FileNotFoundError('Could not find project yaml file {}'.format(yaml_file))
@@ -83,11 +111,11 @@ class ProjectType(object):
     def _fetch_project(self):
         raise NotImplementedError
 
-    def _execute_and_raise_on_failure(self, command, message, cwd=None):
+    def _execute_and_raise_on_failure(self, command, message, cwd=None, env_vars=None):
         """
         :rtype: string
         """
-        output, exit_code = self.execute_command_in_project(command, cwd=cwd)
+        output, exit_code = self.execute_command_in_project(command, cwd=cwd, extra_environment_vars=env_vars)
         # If the command was intentionally killed, do not raise an error
         if exit_code != 0 and not self._kill_event.is_set():
             raise RuntimeError('{} Command: "{}"\nOutput: "{}"'.format(message, command, output))
@@ -108,7 +136,6 @@ class ProjectType(object):
         """
         self.run_job_config_teardown(timeout=timeout)
         self._logger.info('ProjectType teardown complete.')
-        # TODO: run _teardown_executors for each executor if this is a Docker project_type, like _setup_executors above
 
     def run_job_config_setup(self):
         """
@@ -166,7 +193,8 @@ class ProjectType(object):
         """
         return command
 
-    def execute_command_in_project(self, command, extra_environment_vars=None, timeout=None, **popen_kwargs):
+    def execute_command_in_project(self, command, extra_environment_vars=None, timeout=None, output_file=None,
+                                   **popen_kwargs):
         """
         Execute a command in the context of the project
 
@@ -176,6 +204,9 @@ class ProjectType(object):
         :type extra_environment_vars: dict[str, str]
         :param timeout: A maximum number of seconds before the process is terminated, or None for no timeout
         :type timeout: int | None
+        :param output_file: The file to write console output to (both stdout and stderr). If not specified,
+                            will generate a TemporaryFile. This method will close the file.
+        :type output_file: BufferedRandom | None
         :param popen_kwargs: additional keyword arguments to pass through to subprocess.Popen
         :type popen_kwargs: dict[str, mixed]
         :return: a tuple of (the string output from the command, the exit code of the command)
@@ -186,17 +217,50 @@ class ProjectType(object):
         self._logger.debug('Executing command in project: {}', command)
 
         # Redirect output to files instead of using pipes to avoid: https://github.com/box/ClusterRunner/issues/57
-        stdout_file = TemporaryFile()
-        stderr_file = TemporaryFile()
-        pipe = Popen(
+        output_file = output_file if output_file is not None else TemporaryFile()
+        pipe = Popen_with_delayed_expansion(
             command,
             shell=True,
-            stdout=stdout_file,
-            stderr=stderr_file,
+            stdout=output_file,
+            stderr=STDOUT,  # Redirect stderr to stdout, as we do not care to distinguish the two.
             start_new_session=True,  # Starts a new process group (so we can kill it without killing clusterrunner).
             **popen_kwargs
         )
 
+        clusterrunner_error_msgs = self._wait_for_pipe_to_close(pipe, command, timeout)
+        console_output = self._read_file_contents_and_close(output_file)
+        exit_code = pipe.returncode
+
+        if exit_code != 0:
+            max_log_length = 300
+            logged_console_output = console_output
+            if len(console_output) > max_log_length:
+                logged_console_output = '{}... (total output length: {})'.format(console_output[:max_log_length],
+                                                                                 len(console_output))
+
+            # Note we are intentionally not logging at error or warning level here. Interpreting a non-zero return
+            # code as a failure is context-dependent, so we can't make that determination here.
+            self._logger.notice(
+                'Command exited with non-zero exit code.\nCommand: {}\nExit code: {}\nConsole output: {}\n',
+                command, exit_code, logged_console_output)
+        else:
+            self._logger.debug('Command completed with exit code {}.', exit_code)
+
+        exit_code = exit_code if exit_code is not None else -1  # Make sure we always return an int.
+        combined_command_output = '\n'.join([console_output] + clusterrunner_error_msgs)
+        return combined_command_output, exit_code
+
+    def _wait_for_pipe_to_close(self, pipe, command, timeout):
+        """
+        Wait for the pipe to close (after command completes) or until timeout. If timeout is reached, then
+        kill the pipe as well as any child processes spawned.
+
+        :type pipe: Popen
+        :type command: str
+        :type timeout: int | None
+        :return: the list of error encountered while waiting for the pipe to close.
+        :rtype: list[str]
+        """
         clusterrunner_error_msgs = []
         command_completed = False
         timeout_time = time.time() + (timeout or float('inf'))
@@ -220,13 +284,17 @@ class ProjectType(object):
             # We've been signaled to terminate subprocesses, so terminate them. But we still collect stdout and stderr.
             # We must kill the entire process group since shell=True launches 'sh -c "cmd"' and just killing the pid
             # will kill only "sh" and not its child processes.
-            # Note: We may lose buffered output from the subprocess that hasn't been flushed before termination. If we
-            # want to prevent output buffering we should refactor this method to use pexpect.
+            # Note: We may lose buffered output from the subprocess that hasn't been flushed before termination.
             self._logger.warning('Terminating PID: {}, Command: "{}"', pipe.pid, command)
             try:
                 # todo: os.killpg sends a SIGTERM to all processes in the process group. If the immediate child process
                 # ("sh") dies but its child processes do not, we will leave them running orphaned.
-                os.killpg(pipe.pid, signal.SIGTERM)
+                try:
+                    os.killpg(pipe.pid, signal.SIGTERM)
+                except AttributeError:
+                    self._logger.warning('os.killpg is not available. This is expected if ClusterRunner is running'
+                                         'on Windows. Using os.kill instead.')
+                    os.kill(pipe.pid, signal.SIGTERM)
             except (PermissionError, ProcessLookupError) as ex:  # os.killpg will raise if process has already ended
                 self._logger.warning('Attempted to kill process group (pgid: {}) but raised {}: "{}".',
                                      pipe.pid, type(ex).__name__, ex)
@@ -238,28 +306,7 @@ class ProjectType(object):
                 clusterrunner_error_msgs.append(
                     'ClusterRunner: {} ({}: "{}")'.format(error_message, type(ex).__name__, ex))
 
-        stdout, stderr = [self._read_file_contents_and_close(f) for f in [stdout_file, stderr_file]]
-        exit_code = pipe.returncode
-
-        if exit_code != 0:
-            max_log_length = 300
-            logged_stdout, logged_stderr = stdout, stderr
-            if len(stdout) > max_log_length:
-                logged_stdout = '{}... (total stdout length: {})'.format(stdout[:max_log_length], len(stdout))
-            if len(stderr) > max_log_length:
-                logged_stderr = '{}... (total stderr length: {})'.format(stderr[:max_log_length], len(stderr))
-
-            # Note we are intentionally not logging at error or warning level here. Interpreting a non-zero return code
-            # as a failure is context-dependent, so we can't make that determination here.
-            self._logger.notice(
-                'Command exited with non-zero exit code.\nCommand: {}\nExit code: {}\nStdout: {}\nStderr: {}\n',
-                command, exit_code, logged_stdout, logged_stderr)
-        else:
-            self._logger.debug('Command completed with exit code {}.', exit_code)
-
-        exit_code = exit_code if exit_code is not None else -1  # Make sure we always return an int.
-        combined_command_output = '\n'.join([stdout, stderr] + clusterrunner_error_msgs)
-        return combined_command_output, exit_code
+        return clusterrunner_error_msgs
 
     def _read_file_contents_and_close(self, file):
         """
@@ -304,7 +351,7 @@ class ProjectType(object):
         environment_vars = self._get_environment_vars()
         environment_vars.update(extra_environment_vars or {})
 
-        commands = ['export {}="{}";'.format(key, value) for key, value in environment_vars.items()]
+        commands = [get_environment_variable_setter_command(key, value) for key, value in environment_vars.items()]
         return ' '.join(commands)
 
     def kill_subprocesses(self):

@@ -23,9 +23,17 @@ test-unit:
 	$(call print_msg, Running unit tests... )
 	nosetests -v test/unit
 
+test-unit-with-coverage:
+	$(call print_msg, Running unit tests with coverage... )
+	nosetests -v --with-xcoverage --cover-package=app test/unit
+
+test-integration-with-coverage:
+	$(call print_msg, Running unit tests with coverage... )
+	nosetests -v --with-xcoverage --cover-package=app test/integration
+
 test-unit-via-clusterrunner:
 	$(call print_msg, Running unit tests via ClusterRunner... )
-	./main.py build
+	./main.py build --job-name Unit
 	./main.py stop
 
 test-functional:

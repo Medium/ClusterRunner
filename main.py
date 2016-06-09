@@ -3,7 +3,6 @@
 import argparse
 import hashlib
 import os
-import signal
 import sys
 import threading
 import time
@@ -11,6 +10,7 @@ import time
 from app.subcommands.build_subcommand import BuildSubcommand
 from app.subcommands.deploy_subcommand import DeploySubcommand
 from app.subcommands.master_subcommand import MasterSubcommand
+from app.subcommands.shutdown_subcommand import ShutdownSubcommand
 from app.subcommands.slave_subcommand import SlaveSubcommand
 from app.subcommands.stop_subcommand import StopSubcommand
 from app.util import app_info, autoversioning, log, util
@@ -120,7 +120,32 @@ def _parse_args(args):
     _add_project_type_subparsers(build_parser)
     build_parser.set_defaults(subcommand_class=BuildSubcommand)
 
-    for subparser in (master_parser, slave_parser, build_parser, stop_parser, deploy_parser):
+
+    shutdown_parser = subparsers.add_parser(
+        'shutdown',
+        help='Put slaves in shutdown mode so they can be terminated safely. Slaves in shutdown mode will finish any ' +
+             'subjobs they are currently executing, then die.',
+        formatter_class=ClusterRunnerHelpFormatter
+    )
+    shutdown_parser.add_argument(
+        '-m', '--master-url',
+        help='The url of the master, including the port'
+    )
+    shutdown_parser.add_argument(
+        '-a', '--all-slaves',
+        action='store_true',
+        help='Shutdown all slaves'
+    )
+    shutdown_parser.add_argument(
+        '-s', '--slave-id',
+        action='append',
+        dest='slave_ids',
+        help='A slave id to shut down.'
+    )
+
+    shutdown_parser.set_defaults(subcommand_class=ShutdownSubcommand)
+
+    for subparser in (master_parser, slave_parser, build_parser, stop_parser, deploy_parser, shutdown_parser):
         subparser.add_argument(
             '-v', '--verbose',
             action='store_const', const='DEBUG', dest='log_level', help='set the log level to "debug"')
@@ -138,7 +163,7 @@ def _parse_args(args):
 
 def _add_project_type_subparsers(build_parser):
     """
-    Iterate through each project type (e.g., docker, git, etc.) and add a separate parser with the appropriate
+    Iterate through each project type (e.g., git, etc.) and add a separate parser with the appropriate
     arguments.
 
     :type build_parser: ArgumentParser
@@ -239,8 +264,8 @@ def _start_app_force_kill_countdown(seconds):
         logger = log.get_logger(__name__)
         logger.error('ClusterRunner did not exit within {} seconds. App debug info:\n\n{}.',
                      seconds, app_info.get_app_info_string())
-        logger.critical('ClusterRunner seems to be hanging unexpectedly. Sending SIGKILL to self. Farewell!')
-        os.kill(os.getpid(), signal.SIGKILL)
+        logger.critical('ClusterRunner seems to be hanging unexpectedly. Hard killing the process. Farewell!')
+        os._exit(1)
 
     # Execute on a daemon thread so that the countdown itself will not prevent the app from exiting naturally.
     threading.Thread(target=log_app_debug_info_and_force_kill_after_delay, name='SuicideThread', daemon=True).start()

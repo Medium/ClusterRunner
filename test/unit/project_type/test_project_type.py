@@ -14,8 +14,11 @@ class TestProjectType(BaseUnitTestCase):
 
     def setUp(self):
         super().setUp()
-        self.mock_popen = self.patch('app.project_type.project_type.Popen').return_value
-        self.mock_killpg = self.patch('os.killpg')
+        self.mock_popen = self.patch('app.project_type.project_type.Popen_with_delayed_expansion').return_value
+        try:
+            self.mock_kill = self.patch('os.killpg')
+        except AttributeError:
+            self.mock_kill = self.patch('os.kill')
         self.mock_temporary_files = []
         self.mock_TemporaryFile = self.patch('app.project_type.project_type.TemporaryFile',
                                              side_effect=self.mock_temporary_files)
@@ -25,9 +28,8 @@ class TestProjectType(BaseUnitTestCase):
         next_tempfile_mock.read.return_value = contents
         self.mock_temporary_files.append(next_tempfile_mock)
 
-    def _mock_stdout_and_stderr(self, stdout_content, stderr_content):
-        self._mock_next_tempfile(contents=stdout_content)
-        self._mock_next_tempfile(contents=stderr_content)
+    def _mock_console_output(self, console_output):
+        self._mock_next_tempfile(contents=console_output)
 
     def test_required_constructor_args_are_correctly_detected_without_defaults(self):
         actual_required_args = _FakeEnvWithoutDefaultArgs.required_constructor_argument_names()
@@ -75,7 +77,7 @@ class TestProjectType(BaseUnitTestCase):
 
     def test_execute_command_in_project_does_not_choke_on_weird_command_output(self):
         some_weird_output = b'\xbf\xe2\x98\x82'  # the byte \xbf is invalid unicode
-        self._mock_stdout_and_stderr(some_weird_output, b'')
+        self._mock_console_output(some_weird_output)
         self.mock_popen.returncode = 0
 
         project_type = ProjectType()
@@ -100,7 +102,7 @@ class TestProjectType(BaseUnitTestCase):
             self.assertEqual(arg_name in arg_mapping, expected)
 
     def test_calling_kill_subprocesses_will_break_out_of_command_execution_wait_loop(self):
-        self._mock_stdout_and_stderr(b'fake_output', b'fake_error')
+        self._mock_console_output(b'fake_output')
         self.mock_popen.pid = 55555
         self._simulate_hanging_popen_process()
 
@@ -118,10 +120,10 @@ class TestProjectType(BaseUnitTestCase):
         with UnhandledExceptionHandler.singleton():
             command_thread.join(timeout=10)
             if command_thread.is_alive():
-                self.mock_killpg()  # Calling killpg() causes the command thread to end.
+                self.mock_kill()  # Calling killpg() causes the command thread to end.
                 self.fail('project_type.kill_subprocesses should cause the command execution wait loop to exit.')
 
-        self.mock_killpg.assert_called_once_with(55555, ANY)  # Note: os.killpg does not accept keyword args.
+        self.mock_kill.assert_called_once_with(55555, ANY)  # Note: os.killpg does not accept keyword args.
 
     def test_command_exiting_normally_will_break_out_of_command_execution_wait_loop(self):
         timeout_exc = TimeoutExpired(cmd=None, timeout=1)
@@ -129,13 +131,13 @@ class TestProjectType(BaseUnitTestCase):
         # Simulate Popen.wait() timing out twice before command completes and returns output.
         self.mock_popen.wait.side_effect = [timeout_exc, timeout_exc, expected_return_code]
         self.mock_popen.returncode = expected_return_code
-        self._mock_stdout_and_stderr(b'fake_output', b'fake_error')
+        self._mock_console_output(b'fake_output')
 
         project_type = ProjectType()
         actual_output, actual_return_code = project_type.execute_command_in_project('echo The power is yours!')
 
-        self.assertEqual(self.mock_killpg.call_count, 0, 'os.killpg should not be called when command exits normally.')
-        self.assertEqual(actual_output, 'fake_output\nfake_error', 'Output should contain stdout and stderr.')
+        self.assertEqual(self.mock_kill.call_count, 0, 'os.killpg should not be called when command exits normally.')
+        self.assertEqual(actual_output, 'fake_output', 'Output did not contain expected contents.')
         self.assertEqual(actual_return_code, expected_return_code, 'Actual return code should match expected.')
         self.assertTrue(all([file.close.called for file in self.mock_temporary_files]),
                         'All created TemporaryFiles should be closed so that they are removed from the filesystem.')
@@ -146,14 +148,14 @@ class TestProjectType(BaseUnitTestCase):
         expected_return_code = 1
         self._simulate_hanging_popen_process(fake_returncode=expected_return_code)
         self.mock_popen.pid = 55555
-        self._mock_stdout_and_stderr(b'fake output', b'fake error')
+        self._mock_console_output(b'fake output')
 
         project_type = ProjectType()
         actual_output, actual_return_code = project_type.execute_command_in_project(
             command='sleep 99', timeout=250)
 
-        self.assertEqual(self.mock_killpg.call_count, 1, 'os.killpg should be called when execution times out.')
-        self.assertEqual(actual_output, 'fake output\nfake error', 'Output should contain stdout and stderr.')
+        self.assertEqual(self.mock_kill.call_count, 1, 'os.killpg should be called when execution times out.')
+        self.assertEqual(actual_output, 'fake output', 'Output did not contain expected contents.')
         self.assertEqual(actual_return_code, expected_return_code, 'Actual return code should match expected.')
         self.assertTrue(all([file.close.called for file in self.mock_temporary_files]),
                         'All created TemporaryFiles should be closed so that they are removed from the filesystem.')
@@ -167,12 +169,12 @@ class TestProjectType(BaseUnitTestCase):
         self.mock_popen.wait.side_effect = [timeout_exc, timeout_exc, value_err_exc, fake_failing_return_code]
         self.mock_popen.returncode = fake_failing_return_code
         self.mock_popen.pid = 55555
-        self._mock_stdout_and_stderr(b'', b'')
+        self._mock_console_output(b'')
 
         project_type = ProjectType()
         actual_output, actual_return_code = project_type.execute_command_in_project('echo The power is yours!')
 
-        self.assertEqual(self.mock_killpg.call_count, 1, 'os.killpg should be called when wait() raises exception.')
+        self.assertEqual(self.mock_kill.call_count, 1, 'os.killpg should be called when wait() raises exception.')
         self.assertIn(exception_message, actual_output, 'ClusterRunner exception message should be included in output.')
         self.assertEqual(actual_return_code, fake_failing_return_code, 'Actual return code should match expected.')
 
@@ -181,7 +183,7 @@ class TestProjectType(BaseUnitTestCase):
         mock_time.side_effect = [0.0, 100.0, 200.0, 300.0]  # time increases by 100 seconds with each loop
         fake_failing_return_code = -15
         self.mock_popen.pid = 55555
-        self._mock_stdout_and_stderr(b'', b'')
+        self._mock_console_output(b'')
         exception_message = 'Something terribly horrible just happened!'
         self._simulate_hanging_popen_process(
             fake_returncode=fake_failing_return_code, wait_exception=ValueError(exception_message))
@@ -195,7 +197,7 @@ class TestProjectType(BaseUnitTestCase):
 
     def test_failing_exit_code_is_injected_when_no_return_code_available(self):
         self.mock_popen.returncode = None  # This will happen if we were not able to terminate the process.
-        self._mock_stdout_and_stderr(b'', b'')
+        self._mock_console_output(b'')
 
         project_type = ProjectType()
         actual_output, actual_return_code = project_type.execute_command_in_project('echo The power is yours!')
@@ -228,9 +230,9 @@ class TestProjectType(BaseUnitTestCase):
         """
         def fake_wait(timeout=None):
             # The fake implementation is that wait() times out forever until os.killpg is called.
-            if self.mock_killpg.call_count == 0 and timeout is not None:
+            if self.mock_kill.call_count == 0 and timeout is not None:
                 raise TimeoutExpired(None, timeout)
-            elif self.mock_killpg.call_count > 0:
+            elif self.mock_kill.call_count > 0:
                 if wait_exception:
                     raise wait_exception
                 return fake_returncode
@@ -238,6 +240,22 @@ class TestProjectType(BaseUnitTestCase):
 
         self.mock_popen.wait.side_effect = fake_wait
         self.mock_popen.returncode = fake_returncode
+
+    def test_job_config_uses_passed_in_config_instead_of_clusterrunner_yaml(self):
+        config_dict = {
+            'commands': ['shell command 1', 'shell command 2;'],
+            'atomizers': [{'TESTPATH': 'atomizer command'}],
+            'max_executors': 100,
+            'max_executors_per_slave': 2,
+        }
+        project_type = ProjectType(config=config_dict, job_name='some_job_name')
+
+        job_config = project_type.job_config()
+
+        self.assertEquals(job_config.name, 'some_job_name')
+        self.assertEquals(job_config.command, 'shell command 1 && shell command 2')
+        self.assertEquals(job_config.max_executors, 100)
+        self.assertEquals(job_config.max_executors_per_slave, 2)
 
 
 class _FakeEnvWithoutDefaultArgs(ProjectType):

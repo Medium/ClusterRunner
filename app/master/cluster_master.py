@@ -1,9 +1,11 @@
 from collections import OrderedDict
 import os
 
+from app.common.cluster_service import ClusterService
 from app.master.build import Build
 from app.master.build_request import BuildRequest
 from app.master.build_request_handler import BuildRequestHandler
+from app.master.build_scheduler_pool import BuildSchedulerPool
 from app.master.slave import Slave
 from app.master.slave_allocator import SlaveAllocator
 from app.slave.cluster_slave import SlaveState
@@ -13,7 +15,7 @@ from app.util import fs
 from app.util.log import get_logger
 
 
-class ClusterMaster(object):
+class ClusterMaster(ClusterService):
     """
     The ClusterRunner Master service: This is the main application class that the web framework/REST API sits on top of.
     """
@@ -25,7 +27,8 @@ class ClusterMaster(object):
         self._master_results_path = Configuration['results_directory']
         self._all_slaves_by_url = {}
         self._all_builds_by_id = OrderedDict()
-        self._build_request_handler = BuildRequestHandler()
+        self._scheduler_pool = BuildSchedulerPool()
+        self._build_request_handler = BuildRequestHandler(self._scheduler_pool)
         self._build_request_handler.start()
         self._slave_allocator = SlaveAllocator(self._build_request_handler)
         self._slave_allocator.start()
@@ -105,19 +108,41 @@ class ClusterMaster(object):
 
         raise ItemNotFoundError('Requested slave ({}) does not exist.'.format(slave_id))
 
-    def connect_new_slave(self, slave_url, num_executors):
+    def connect_slave(self, slave_url, num_executors, slave_session_id=None):
         """
-        Add a new slave to this master.
+        Connect a slave to this master.
 
         :type slave_url: str
         :type num_executors: int
-        :return: The slave id of the new slave
-        :rtype: int
+        :type slave_session_id: str | None
+        :return: The response with the slave id of the slave.
+        :rtype: dict[str, str]
         """
-        slave = Slave(slave_url, num_executors)
+        # todo: Validate arg types for this and other methods called via API.
+        # If a slave had previously been connected, and is now being reconnected, the cleanest way to resolve this
+        # bookkeeping is for the master to forget about the previous slave instance and start with a fresh instance.
+        if slave_url in self._all_slaves_by_url:
+            old_slave = self._all_slaves_by_url.get(slave_url)
+            self._logger.warning('Slave requested to connect to master, even though previously connected as {}. ' +
+                                 'Removing existing slave instance from the master\'s bookkeeping.', old_slave)
+
+            # If a slave has requested to reconnect, we have to assume that whatever build the dead slave was
+            # working on no longer has valid results.
+            if old_slave.current_build_id is not None:
+                self._logger.info('{} has build [{}] running on it. Attempting to cancel build.', old_slave,
+                                  old_slave.current_build_id)
+                try:
+                    build = self.get_build(old_slave.current_build_id)
+                    build.cancel()
+                    self._logger.info('Cancelled build {} due to dead slave {}', old_slave.current_build_id,
+                                      old_slave)
+                except ItemNotFoundError:
+                    self._logger.info('Failed to find build {} that was running on {}', old_slave.current_build_id,
+                                      old_slave)
+
+        slave = Slave(slave_url, num_executors, slave_session_id)
         self._all_slaves_by_url[slave_url] = slave
         self._slave_allocator.add_idle_slave(slave)
-
         self._logger.info('Slave on {} connected to master with {} executors. (id: {})',
                           slave_url, num_executors, slave.id)
         return {'slave_id': str(slave.id)}
@@ -131,6 +156,7 @@ class ClusterMaster(object):
         """
         slave_transition_functions = {
             SlaveState.DISCONNECTED: self._disconnect_slave,
+            SlaveState.SHUTDOWN: self._graceful_shutdown_slave,
             SlaveState.IDLE: self._slave_allocator.add_idle_slave,
             SlaveState.SETUP_COMPLETED: self._handle_setup_success_on_slave,
             SlaveState.SETUP_FAILED: self._handle_setup_failure_on_slave,
@@ -143,6 +169,24 @@ class ClusterMaster(object):
         do_transition = slave_transition_functions.get(new_slave_state)
         do_transition(slave)
 
+    def set_shutdown_mode_on_slaves(self, slave_ids):
+        """
+        :type slave_ids: list[int]
+        """
+        # Find all the slaves first so if an invalid slave_id is specified, we 404 before shutting any of them down.
+        slaves = [self.get_slave(slave_id) for slave_id in slave_ids]
+        for slave in slaves:
+            self.handle_slave_state_update(slave, SlaveState.SHUTDOWN)
+
+    def _graceful_shutdown_slave(self, slave):
+        """
+        Puts slave in shutdown mode so it cannot receive new builds. The slave will be killed when finished with any
+        running builds.
+        :type slave: Slave
+        """
+        slave.set_shutdown_mode()
+        self._logger.info('Slave on {} was put in shutdown mode. (id: {})', slave.url, slave.id)
+
     def _disconnect_slave(self, slave):
         """
         Mark a slave dead.
@@ -151,8 +195,7 @@ class ClusterMaster(object):
         """
         # Mark slave dead. We do not remove it from the list of all slaves. We also do not remove it from idle_slaves;
         # that will happen during slave allocation.
-        slave.set_is_alive(False)
-        slave.current_build_id = None
+        slave.mark_dead()
         # todo: Fail/resend any currently executing subjobs still executing on this slave.
         self._logger.info('Slave on {} was disconnected. (id: {})', slave.url, slave.id)
 
@@ -164,7 +207,8 @@ class ClusterMaster(object):
         :type slave: Slave
         """
         build = self.get_build(slave.current_build_id)
-        build.begin_subjob_executions_on_slave(slave)
+        scheduler = self._scheduler_pool.get(build)
+        scheduler.begin_subjob_executions_on_slave(slave)
 
     def _handle_setup_failure_on_slave(self, slave):
         """
@@ -191,7 +235,7 @@ class ClusterMaster(object):
         if build_request.is_valid():
             build = Build(build_request)
             self._all_builds_by_id[build.build_id()] = build
-            build.generate_project_type()
+            build.generate_project_type()  # WIP(joey): This should be internal to the Build object.
             self._build_request_handler.handle_build_request(build)
             response = {'build_id': build.build_id()}
             success = True
@@ -234,12 +278,14 @@ class ClusterMaster(object):
         self._logger.info('Results received from {} for subjob. (Build {}, Subjob {})', slave_url, build_id, subjob_id)
         build = self._all_builds_by_id[int(build_id)]
         slave = self._all_slaves_by_url[slave_url]
+
         # If the build has been canceled or failed, don't work on the next subjob.
         if not build.is_finished or build.has_error:
             try:
                 build.complete_subjob(subjob_id, payload)
             finally:
-                build.execute_next_subjob_or_teardown_slave(slave)
+                scheduler = self._scheduler_pool.get(build)
+                scheduler.execute_next_subjob_or_free_executor(slave)
 
     def get_build(self, build_id):
         """
@@ -250,7 +296,7 @@ class ClusterMaster(object):
         """
         build = self._all_builds_by_id.get(build_id)
         if build is None:
-            raise ItemNotFoundError('Invalid build id.')
+            raise ItemNotFoundError('Invalid build id: {}.'.format(build_id))
 
         return build
 

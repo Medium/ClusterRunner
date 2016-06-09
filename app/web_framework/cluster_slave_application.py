@@ -27,7 +27,13 @@ class ClusterSlaveApplication(ClusterApplication):
                             RouteNode(r'setup', _BuildSetupHandler),
                             RouteNode(r'teardown', _TeardownHandler),
                             RouteNode(r'subjob', _SubjobsHandler, 'subjobs').add_children([
-                                RouteNode(r'(\d+)', _SubjobHandler, 'subjob')
+                                RouteNode(r'(\d+)', _SubjobHandler, 'subjob').add_children([
+                                    RouteNode(r'atom', _AtomsHandler, 'atoms').add_children([
+                                        RouteNode(r'(\d+)', _AtomHandler).add_children([
+                                            RouteNode(r'console', _AtomConsoleHandler)
+                                        ])
+                                    ])
+                                ])
                             ])
                         ])
                     ]),
@@ -102,11 +108,10 @@ class _SubjobsHandler(_ClusterSlaveBaseAPIHandler):
 class _SubjobHandler(_ClusterSlaveBaseAPIHandler):
     @authenticated
     def post(self, build_id, subjob_id):
-        subjob_artifact_dir = self.decoded_body.get('subjob_artifact_dir')
         atomic_commands = self.decoded_body.get('atomic_commands')
 
         response = self._cluster_slave.start_working_on_subjob(
-            int(build_id), int(subjob_id), subjob_artifact_dir, atomic_commands
+            int(build_id), int(subjob_id), atomic_commands
         )
         self._write_status(response, status_code=201)
 
@@ -114,6 +119,42 @@ class _SubjobHandler(_ClusterSlaveBaseAPIHandler):
         response = {
             'comment': 'not implemented',
         }
+        self.write(response)
+
+
+class _AtomsHandler(_ClusterSlaveBaseAPIHandler):
+    pass
+
+
+class _AtomHandler(_ClusterSlaveBaseAPIHandler):
+    pass
+
+
+class _AtomConsoleHandler(_ClusterSlaveBaseAPIHandler):
+    def get(self, build_id, subjob_id, atom_id):
+        """
+        :type build_id: int
+        :type subjob_id: int
+        :type atom_id: int
+        """
+        # Because the 'Origin' header in the redirect (from the master) gets set to 'null', the only way
+        # for the client to receive this response is for us to allow any origin to receive this response.
+        self.set_header('Access-Control-Allow-Origin', '*')
+
+        max_lines = int(self.get_query_argument('max_lines', 50))
+        offset_line = self.get_query_argument('offset_line', None)
+
+        if offset_line is not None:
+            offset_line = int(offset_line)
+
+        response = self._cluster_slave.get_console_output(
+            build_id,
+            subjob_id,
+            atom_id,
+            Configuration['artifact_directory'],
+            max_lines,
+            offset_line
+        )
         self.write(response)
 
 
@@ -145,6 +186,7 @@ class _EventlogHandler(_ClusterSlaveBaseAPIHandler):
 
 
 class _KillHandler(_ClusterSlaveBaseAPIHandler):
+    @authenticated
     def post(self):
         self._write_status()
         kill_thread = SafeThread(

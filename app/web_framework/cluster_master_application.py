@@ -1,14 +1,22 @@
 import http.client
 import os
+import urllib.parse
+
 import tornado.web
 
 from app.util import analytics
+from app.util import log
 from app.util.conf.configuration import Configuration
 from app.util.decorators import authenticated
+from app.util.exceptions import ItemNotFoundError
+from app.util.url_builder import UrlBuilder
 from app.web_framework.cluster_application import ClusterApplication
 from app.web_framework.cluster_base_handler import ClusterBaseAPIHandler, ClusterBaseHandler
 from app.web_framework.route_node import RouteNode
 
+
+# pylint: disable=attribute-defined-outside-init
+#   Handler classes are not designed to have __init__ overridden.
 
 class ClusterMasterApplication(ClusterApplication):
 
@@ -32,7 +40,9 @@ class ClusterMasterApplication(ClusterApplication):
                             RouteNode(r'subjob', _SubjobsHandler, 'subjobs').add_children([
                                 RouteNode(r'(\d+)', _SubjobHandler, 'subjob').add_children([
                                     RouteNode(r'atom', _AtomsHandler, 'atoms').add_children([
-                                        RouteNode(r'(\d+)', _AtomHandler, 'atom')
+                                        RouteNode(r'(\d+)', _AtomHandler, 'atom').add_children([
+                                            RouteNode(r'console', _AtomConsoleHandler)
+                                        ])
                                     ]),
                                     RouteNode(r'result', _SubjobResultHandler)
                                 ])
@@ -41,7 +51,10 @@ class ClusterMasterApplication(ClusterApplication):
                     ]),
                     RouteNode(r'queue', _QueueHandler),
                     RouteNode(r'slave', _SlavesHandler, 'slaves').add_children([
-                        RouteNode(r'(\d+)', _SlaveHandler, 'slave')
+                        RouteNode(r'(\d+)', _SlaveHandler, 'slave').add_children([
+                            RouteNode(r'shutdown', _SlaveShutdownHandler, 'shutdown')
+                        ]),
+                        RouteNode(r'shutdown', _SlavesShutdownHandler, 'shutdown')
                     ]),
                     RouteNode(r'eventlog', _EventlogHandler)
                 ])
@@ -56,6 +69,7 @@ class _ClusterMasterBaseAPIHandler(ClusterBaseAPIHandler):
         :type route_node: RouteNode | None
         :type cluster_master: ClusterMaster | None
         """
+        self._logger = log.get_logger(__name__)
         self._cluster_master = cluster_master
         super().initialize(route_node)
 
@@ -133,7 +147,7 @@ class _AtomsHandler(_ClusterMasterBaseAPIHandler):
         build = self._cluster_master.get_build(int(build_id))
         subjob = build.subjob(int(subjob_id))
         response = {
-            'atoms': subjob.get_atoms(),
+            'atoms': [atom.api_representation() for atom in subjob.atoms()],
         }
         self.write(response)
 
@@ -142,11 +156,56 @@ class _AtomHandler(_ClusterMasterBaseAPIHandler):
     def get(self, build_id, subjob_id, atom_id):
         build = self._cluster_master.get_build(int(build_id))
         subjob = build.subjob(int(subjob_id))
-        atoms = subjob.get_atoms()
+        atoms = subjob.atoms
         response = {
-            'atom': atoms[int(atom_id)],
+            'atom': atoms[int(atom_id)].api_representation(),
         }
         self.write(response)
+
+
+class _AtomConsoleHandler(_ClusterMasterBaseAPIHandler):
+    def get(self, build_id, subjob_id, atom_id):
+        """
+        :type build_id: int
+        :type subjob_id: int
+        :type atom_id: int
+        """
+        max_lines = int(self.get_query_argument('max_lines', 50))
+        offset_line = self.get_query_argument('offset_line', None)
+
+        if offset_line is not None:
+            offset_line = int(offset_line)
+
+        try:
+            response = self._cluster_master.get_console_output(
+                build_id,
+                subjob_id,
+                atom_id,
+                Configuration['results_directory'],
+                max_lines,
+                offset_line
+            )
+            self.write(response)
+            return
+        except ItemNotFoundError as e:
+            # If the master doesn't have the atom's console output, it's possible it's currently being worked on,
+            # in which case the slave that is working on it may be able to provide the in-progress console output.
+            build = self._cluster_master.get_build(int(build_id))
+            subjob = build.subjob(int(subjob_id))
+            slave = subjob.slave
+
+            if slave is None:
+                raise e
+
+            api_url_builder = UrlBuilder(slave.url)
+            slave_console_url = api_url_builder.url('build', build_id, 'subjob', subjob_id, 'atom', atom_id, 'console')
+            query = {'max_lines': max_lines}
+
+            if offset_line is not None:
+                query['offset_line'] = offset_line
+
+            query_string = urllib.parse.urlencode(query)
+            self.redirect('{}?{}'.format(slave_console_url, query_string))
 
 
 class _BuildsHandler(_ClusterMasterBaseAPIHandler):
@@ -216,7 +275,8 @@ class _SlavesHandler(_ClusterMasterBaseAPIHandler):
     def post(self):
         slave_url = self.decoded_body.get('slave')
         num_executors = int(self.decoded_body.get('num_executors'))
-        response = self._cluster_master.connect_new_slave(slave_url, num_executors)
+        session_id = self.decoded_body.get('session_id')
+        response = self._cluster_master.connect_slave(slave_url, num_executors, session_id)
         self._write_status(response, status_code=201)
 
     def get(self):
@@ -253,3 +313,21 @@ class _EventlogHandler(_ClusterMasterBaseAPIHandler):
         self.write({
             'events': analytics.get_events(since_timestamp, since_id),
         })
+
+
+class _SlaveShutdownHandler(_ClusterMasterBaseAPIHandler):
+    @authenticated
+    def post(self, slave_id):
+        slaves_to_shutdown = [int(slave_id)]
+
+        self._cluster_master.set_shutdown_mode_on_slaves(slaves_to_shutdown)
+
+
+class _SlavesShutdownHandler(_ClusterMasterBaseAPIHandler):
+    @authenticated
+    def post(self):
+        shutdown_all = self.decoded_body.get('shutdown_all')
+        slaves_to_shutdown = self._cluster_master.all_slaves_by_id().keys() if shutdown_all else\
+            [int(slave_id) for slave_id in self.decoded_body.get('slaves')]
+
+        self._cluster_master.set_shutdown_mode_on_slaves(slaves_to_shutdown)
