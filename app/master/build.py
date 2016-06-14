@@ -278,6 +278,17 @@ class Build(object):
         """
         self._state_machine.trigger(BuildEvent.FAIL, error_msg=failure_reason)
 
+    def mark_setup_failed(self, failure_reason):
+        """
+        Mark a build as failed and set a failure reason. Because setup failures don't have any logs, we put the build_id
+        in the setup_failed file for easier querying of worker logs.
+        :type failure_reason: str
+        """
+        self._state_machine.trigger(BuildEvent.FAIL, error_msg='{} Build Id: {}.'.format(failure_reason, self._build_id))
+        setup_failure_file = os.path.join(self._build_results_dir(), 'setup_failed')
+        app.util.fs.write_file(str(self._build_id), setup_failure_file)
+        self._create_build_artifact()
+
     def _on_enter_error_state(self, event):
         """
         Store an error message for the build and log the failure. This method is triggered by

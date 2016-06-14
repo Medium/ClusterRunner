@@ -217,8 +217,7 @@ class ClusterMaster(ClusterService):
         :type slave: Slave
         """
         build = self.get_build(slave.current_build_id)
-        build.cancel()
-        build.mark_failed('Unable to setup build on slave. Failing the build.')
+        build.mark_setup_failed('Unable to setup build on slave.')
         slave.teardown()
 
     def handle_request_for_new_build(self, build_params):
