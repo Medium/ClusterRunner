@@ -285,7 +285,7 @@ class Build(object):
         :type failure_reason: str
         """
         self._state_machine.trigger(BuildEvent.FAIL, error_msg='{} Build Id: {}.'.format(failure_reason, self._build_id))
-        setup_failure_file = os.path.join(self._build_results_dir(), 'setup_failed')
+        setup_failure_file = os.path.join(self._build_results_dir(), BuildArtifact.SETUP_FAILED_FILE)
         app.util.fs.write_file(str(self._build_id), setup_failure_file)
         self._create_build_artifact()
 
