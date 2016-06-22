@@ -66,8 +66,8 @@ class TestBuildRunner(BaseUnitTestCase):
             expected_log_warning_args=[call('Script aborted due to error!')],
             expected_log_error_args=[call('Build aborted due to error: None')],
         )
-        self.assertFalse(runner._download_and_extract_results.called,
-                         'Client should not have tried to download results')
+        self.assertTrue(runner._download_and_extract_results.called,
+                         'Client should have tried to download results')
 
     def test_runner_should_abort_when_status_is_invalid(self):
         runner, logger, build_id = self._create_build_runner_instance({'build': 'x'})
@@ -88,5 +88,5 @@ class TestBuildRunner(BaseUnitTestCase):
                 ),
             ],
         )
-        self.assertFalse(runner._download_and_extract_results.called,
-                         'Client should not have tried to download results')
+        self.assertTrue(runner._download_and_extract_results.called,
+                         'Client should have tried to download results')
