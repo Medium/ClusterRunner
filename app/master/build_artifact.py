@@ -13,6 +13,7 @@ class BuildArtifact(object):
     COMMAND_FILE = 'clusterrunner_command'
     EXIT_CODE_FILE = 'clusterrunner_exit_code'
     OUTPUT_FILE = 'clusterrunner_console_output'
+    SETUP_FAILED_FILE = 'clusterrunner_setup_failed'
     TIMING_FILE = 'clusterrunner_time'
     ARTIFACT_FILE_NAME = 'results.tar.gz'
 

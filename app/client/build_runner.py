@@ -62,6 +62,7 @@ class BuildRunner(object):
         except _BuildRunnerError as ex:
             self._logger.error(str(ex))
             self._logger.warning('Script aborted due to error!')
+            self._download_and_extract_results()
             self._cancel_build()
             return False
 

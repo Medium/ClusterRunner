@@ -247,7 +247,7 @@ class TestGit(BaseUnitTestCase):
                                                                'expected.')
 
     def test_slave_param_overrides_when_get_project_from_master_is_disabled(self):
-        Configuration['get_project_from_master'] = True
+        Configuration['get_project_from_master'] = False
 
         git = Git(url='http://original-user-specified-url.test/repo-path/repo-name')
         actual_overrides = git.slave_param_overrides()
